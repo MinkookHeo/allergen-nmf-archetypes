@@ -155,7 +155,13 @@ if __name__ == "__main__":
     sns.despine(ax=axes[0, 2])
 
     # --- 2행 및 3행: Consensus 히트맵 (D) ---
-    k_input = input("\n히트맵으로 확인할 K값 입력 (공백 구분, 기본값 K=3~8은 그냥 엔터): ").strip()
+    # 비대화형(재현) 실행에서는 입력을 생략하고 논문 기본값 K=3~8을 쓴다.
+    try:
+        k_input = input(
+            "\n히트맵으로 확인할 K값 입력 (공백 구분, 기본값 K=3~8은 그냥 엔터): "
+        ).strip()
+    except (EOFError, OSError):
+        k_input = ""
     target_ks = [int(v) for v in k_input.split()] if k_input else [3, 4, 5, 6, 7, 8]
 
     # 히트맵을 그릴 6개의 축(axes) 평탄화 추출 (2행과 3행)
