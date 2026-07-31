@@ -1,4 +1,5 @@
 import sqlite3
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -31,6 +32,11 @@ _log = []
 def log(m=""):
     print(m)
     _log.append(str(m))
+
+
+def norm_name(s):
+    """'Genus species (common name)' -> 'Genus species'"""
+    return str(s).split(" (")[0].strip()
 
 # ===========================================================================
 # 1. 통계 유틸
