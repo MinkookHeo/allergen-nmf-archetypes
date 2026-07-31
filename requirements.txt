@@ -1,0 +1,14 @@
+# Core analytical pipeline (01-05)
+pandas>=1.5
+numpy>=1.23
+scipy>=1.9
+scikit-learn>=1.2
+openpyxl>=3.1
+
+# Figures (04 + figure assembly)
+matplotlib>=3.6
+seaborn>=0.12
+plotly>=5.11
+kaleido>=0.2.1        # static PNG export for plotly Sankey (Figure 2C)
+
+# Standard library used: argparse, sqlite3, sys, time, pathlib (no install needed)
