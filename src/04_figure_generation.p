@@ -1,6 +1,45 @@
+# -*- coding: utf-8 -*-
+"""
+04_Figure_Generation.py
+
+204종 x 840 feature 매트릭스로부터 NMF(K=6)를 재현하고,
+논문 그림을 생성한다.
+
+  * 통계 검정(AMI, 편상관 등)은 이 파일에서 분리되어
+    05_statistical_analysis.py 로 이동했다.
+    이 파일은 그림과 그림의 원본 데이터만 만든다.
+
+핵심 원칙
+  - Core/Ambiguous 판정은 원고 2.4 의 단일 기준을 사용한다.
+        is_core = (Relative_Abundance >= 0.80)
+    이전 버전은 하이브리드 기준
+        (DR >= 2.0) AND (Top1_Weight >= 0.3 OR RA >= 0.8)
+    을 썼으나, 두 기준은 본 데이터에서 완전히 동일한 분할을 준다
+    (RA >= 0.80 이면 DR >= 4 가 수학적으로 강제되므로).
+    스크립트가 실행 시 두 기준의 일치를 자동 검증한다.
+  - Archetype 번호는 1..6 (내부 cluster 0..5 + 1)
+
+생성물 (모두 Results_Figures/)
+  Figure1_family_order_barplot.png      : Top10 order / family / protein-family
+  Figure3_dominance_landscape.png       : dominance landscape
+  Figure4_compositional_fingerprint.png : compositional fingerprint
+  Figure5_sankey_taxonomy.html          : alluvial
+  figure_source_data.csv                : 그림 원본 데이터
+  figure_generation_log.txt             : 실행 로그
+
+  주: 원고 개정으로 display item 을 9 -> 6 개로 줄이면서 그림 번호가
+      바뀌었다. 아래 FIGNUM 으로 관리한다.
+        구 Figure 4 -> 신 Figure 3 (dominance landscape)
+        구 Figure 5 -> 신 Figure 4 (fingerprint)
+        구 Figure 6 -> 신 Figure 5 (alluvial)
+
+의존성: pandas numpy scikit-learn matplotlib seaborn plotly
+"""
+
 import os
 import sqlite3
 from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -9,28 +48,40 @@ import seaborn as sns
 from sklearn.decomposition import NMF
 from sklearn.preprocessing import Normalizer
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # 0. 경로 / 상수 (config.py 연동)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from config import DB_PATH, MATRIX_PATH, FIG_DIR, RESULTS_DIR
+from config import DB_PATH, MATRIX_PATH, RESULTS_DIR, FIG_DIR
 
 IN_MATRIX = MATRIX_PATH
+FIGDIR = FIG_DIR  # 개별 그림 저장 위치
 
 K = 6
 RANDOM_STATE = 42
 
+# 원고 개정 후 그림 번호 (구 번호 -> 신 번호)
 FIGNUM = {
-    "barplot": 1,      
-    "landscape": 3,    
-    "fingerprint": 4,  
-    "alluvial": 5,     
+    "barplot": 1,      # 구 Figure 1
+    "landscape": 3,    # 구 Figure 4
+    "fingerprint": 4,  # 구 Figure 5
+    "alluvial": 5,     # 구 Figure 6
 }
 
+FIGDIR.mkdir(parents=True, exist_ok=True)
+
 _log = []
+
+
 def log(m=""):
     print(m)
     _log.append(str(m))
+
+
+def norm_name(s):
+    return str(s).split(" (")[0].strip()
+
 
 # ===========================================================================
 # 1. 로드 + 전처리 + NMF
@@ -289,7 +340,7 @@ def fig_alluvial_taxonomy():
 # ===========================================================================
 if __name__ == "__main__":
     # 그림만 생성한다. AMI / 편상관 등 통계 검정은
-    # 05_Annotation_Bias_Check.py 에서 수행한다.
+    # 05_statistical_analysis.py 에서 수행한다.
     fig_dataset_overview()
     fig_dominance_landscape()
     fig_compositional_fingerprint()
@@ -297,7 +348,7 @@ if __name__ == "__main__":
 
     df.to_csv(FIGDIR / "figure_source_data.csv", index=False,
               encoding="utf-8-sig")
-    (RESULTS / "figure_generation_log.txt").write_text(
+    (RESULTS_DIR / "figure_generation_log.txt").write_text(
         "\n".join(_log), encoding="utf-8")
     log(f"\n[DONE] 그림 -> {FIGDIR}")
-    log("[NEXT] 통계 검정은 05_Annotation_Bias_Check.py 를 실행할 것")
+    log("[NEXT] 통계 검정은 05_statistical_analysis.py 를 실행할 것")
