@@ -1,3 +1,4 @@
+import argparse
 import sys
 from pathlib import Path
 import numpy as np
@@ -21,6 +22,11 @@ _log = []
 def log(m=""):
     print(m)
     _log.append(str(m))
+
+
+def norm_name(s):
+    """'Genus species (common name)' -> 'Genus species'"""
+    return str(s).split(" (")[0].strip()
 
 # ===========================================================================
 # 1. 데이터 로드 및 전처리
@@ -167,7 +173,7 @@ def generate_report(matrix, feature_names, species_names, db_path, k_val):
                            ascending=[True, True, False])
               .drop(columns=["_order"]))
 
-    out_xlsx = RESULTS / f"NMF_Final_Analysis_K{k_val}_Step3_Advanced.xlsx"
+    out_xlsx = RESULTS_DIR / f"NMF_Final_Analysis_K{k_val}_Step3_Advanced.xlsx"
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
         df_sig.to_excel(writer, sheet_name="1_Cluster_Signatures", index=False)
         df_tax.to_excel(writer, sheet_name="2_Species_Membership", index=False)
@@ -178,24 +184,21 @@ def generate_report(matrix, feature_names, species_names, db_path, k_val):
 # 실행
 # ===========================================================================
 if __name__ == "__main__":
-    matrix_norm, features, species = load_final_matrix(IN_MATRIX)
-
-    # K 는 명령행 인자 우선, 없으면 대화형, 그것도 없으면 6
-    if len(sys.argv) > 1:
-        target_ks = [int(v) for v in sys.argv[1:]]
-    else:
-        try:
-            raw_in = input("\n분석할 K값을 입력하세요 (공백 구분, 예: 6 7) [기본 6]: ").strip()
-        except (EOFError, OSError):
-            raw_in = ""
-        target_ks = [int(v) for v in raw_in.split()] if raw_in else [6]
+    parser = argparse.ArgumentParser(
+        description="NMF(K) 종별 아키타입 소속 리포트 생성")
+    parser.add_argument("k", nargs="*", type=int, default=[6],
+                        help="분석할 K값 (공백 구분, 기본 6). 예: 03_cluster_analysis.py 6 7")
+    args = parser.parse_args()
+    target_ks = args.k if args.k else [6]
     log(f"[RUN] 대상 K: {target_ks}")
+
+    matrix_norm, features, species = load_final_matrix(IN_MATRIX)
 
     for k in target_ks:
         generate_report(matrix_norm, features, species, DB_PATH, k)
 
-    (RESULTS / "cluster_analysis_log.txt").write_text(
+    (RESULTS_DIR / "cluster_analysis_log.txt").write_text(
         "\n".join(_log), encoding="utf-8")
-    log(f"\n[DONE] 로그 -> {RESULTS / 'cluster_analysis_log.txt'}")
-    log("[NEXT] 04_Figure_Generation.py (그림) -> "
-        "05_Annotation_Bias_Check.py (통계)")
+    log(f"\n[DONE] 로그 -> {RESULTS_DIR / 'cluster_analysis_log.txt'}")
+    log("[NEXT] 04_figure_generation.py (그림) -> "
+        "05_statistical_analysis.py (통계)")
