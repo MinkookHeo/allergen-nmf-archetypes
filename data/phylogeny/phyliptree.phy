@@ -1,0 +1,319 @@
+(
+(
+(
+(
+(
+'Ovis aries':4,
+'Bos taurus':4
+)Bovidae:4,
+'Equus caballus':4
+)Mammalia:4,
+(
+'Pangasianodon hypophthalmus':4,
+'Mugil cephalus':4,
+'Sebastes marinus':4,
+(
+'Lepidorhombus whiffiagonis':4,
+'Solea solea':4,
+'Paralichthys olivaceus':4
+)Pleuronectiformes:4,
+'Xiphias gladius':4,
+(
+(
+'Scomber australasicus':4,
+'Scomber scombrus':4,
+'Scomber japonicus':4
+)Scomber:4,
+'Thunnus albacares':4
+)Scombridae:4,
+'Lates calcarifer':4,
+'Oreochromis mossambicus':4,
+(
+'Pollachius virens':4,
+(
+'Gadus chalcogrammus':4,
+'Gadus morhua':4
+)Gadus:4
+)Gadidae:4,
+(
+'Salvelinus fontinalis':4,
+'Salmo salar':4,
+(
+'Oncorhynchus mykiss':4,
+'Oncorhynchus kisutch':4,
+'Oncorhynchus keta':4
+)Oncorhynchus:4
+)Salmonidae:4,
+(
+'Cyprinus carpio':4,
+'Ctenopharyngodon idella':4
+)Cypriniformes:4,
+(
+'Sardinops melanosticta':4,
+'Clupea harengus':4
+)Clupeidae:4
+)Actinopteri:4,
+'Raja clavata':4
+)Chordata:4,
+(
+'Scolopendra mutilans':4,
+(
+'Acanthoscelides obtectus':4,
+'Liposcelis bostrychophila':4,
+'Apis mellifera':4,
+'Bombyx mori':4
+)Insecta:4,
+(
+'Crangon crangon':4,
+'Panulirus stimpsoni':4,
+(
+(
+'Portunus trituberculatus':4,
+'Portunus pelagicus':4
+)Portunus:4,
+'Charybdis feriata':4,
+(
+'Scylla paramamosain':4,
+'Scylla serrata':4
+)Scylla:4
+)Portunidae:4,
+(
+'Archaeopotamobius sibiriensis':4,
+'Pontastacus leptodactylus':4
+)Astacidae:4,
+(
+'Homarus gammarus':4,
+'Homarus americanus':4
+)Homarus:4,
+(
+'Trachypenaeus curvirostris':4,
+'Metapenaeus ensis':4,
+(
+'Penaeus aztecus':4,
+'Penaeus vannamei':4,
+'Penaeus monodon':4
+)Penaeus:4
+)Penaeidae:4
+)Decapoda:4
+)Arthropoda:4,
+(
+(
+'Haliotis laevigata x Haliotis rubra':4,
+'Haliotis discus':4
+)Haliotis:4,
+(
+(
+'Amphioctopus fangsiao':4,
+'Octopus vulgaris':4
+)Octopodidae:4,
+(
+'Ommastrephes bartramii':4,
+'Todarodes pacificus':4
+)Ommastrephidae:4
+)Cephalopoda:4,
+(
+'Magallana gigas':4,
+'Pecten maximus':4,
+'Mytilus edulis':4
+)Bivalvia:4
+)Mollusca:4,
+'Anisakis simplex':4
+)Metazoa:4,
+(
+(
+'Pinus yunnanensis':4,
+(
+(
+'Hesperocyparis macrocarpa':4,
+'Hesperocyparis arizonica':4
+)Hesperocyparis:4,
+(
+'Juniperus oxycedrus':4,
+'Juniperus ashei':4
+)Juniperus:4,
+'Cryptomeria japonica':4
+)Cupressaceae:4
+)Pinopsida:4,
+(
+(
+'Platanus orientalis':4,
+'Macadamia integrifolia':4
+)Proteales:4,
+'Phoenix dactylifera':4,
+'Vitis vinifera':4,
+'Punica granatum':4,
+(
+'Crocus sativus':4,
+'Allium cepa':4
+)Asparagales:4,
+'Musa acuminata':4,
+(
+'Holcus lanatus':4,
+'Anthoxanthum odoratum':4,
+'Cynodon dactylon':4,
+'Phalaris aquatica':4,
+'Phleum pratense':4,
+'Festuca pratensis':4,
+'Zea mays':4,
+'Triticum aestivum':4,
+'Sorghum halepense':4,
+'Secale cereale':4,
+'Poa pratensis':4,
+'Oryza sativa':4,
+'Lolium perenne':4,
+'Dactylis glomerata':4
+)Poaceae:4,
+(
+'Parthenium hysterophorus':4,
+'Lactuca sativa':4,
+'Helianthus annuus':4,
+(
+'Artemisia lavandulifolia':4,
+'Artemisia gmelinii':4,
+'Artemisia frigida':4,
+'Artemisia capillaris':4,
+'Artemisia argyi':4,
+'Artemisia sieversiana':4,
+'Artemisia ludoviciana':4,
+'Artemisia californica':4,
+'Artemisia absinthium':4,
+'Artemisia tridentata':4,
+'Artemisia vulgaris':4
+)Artemisia:4,
+(
+'Ambrosia psilostachya':4,
+'Ambrosia trifida':4,
+'Ambrosia artemisiifolia':4
+)Ambrosia:4
+)Asteraceae:4,
+(
+'Plantago lanceolata':4,
+'Sesamum indicum':4,
+(
+'Syringa vulgaris':4,
+'Ligustrum vulgare':4,
+'Olea europaea':4
+)Oleaceae:4
+)Lamiales:4,
+(
+(
+'Solanum tuberosum':4,
+'Solanum lycopersicum':4
+)Solanum:4,
+'Capsicum annuum':4
+)Solanaceae:4,
+(
+'Panax ginseng':4,
+(
+'Apium graveolens':4,
+'Daucus carota':4
+)Apiaceae:4
+)Apiales:4,
+(
+'Ricinus communis':4,
+'Manihot esculenta':4,
+'Hevea brasiliensis':4
+)Euphorbiaceae:4,
+(
+'Vigna radiata':4,
+'Lathyrus oleraceus':4,
+'Phaseolus vulgaris':4,
+(
+'Lupinus angustifolius':4,
+'Lupinus albus':4
+)Lupinus:4,
+'Lens culinaris':4,
+'Cicer arietinum':4
+)Fabaceae:4,
+(
+'Ficus benjamina':4,
+(
+'Parietaria judaica':4,
+'Parietaria officinalis':4
+)Parietaria:4,
+(
+'Rubus idaeus':4,
+'Pyrus communis':4,
+'Prunus dulcis':4
+)Rosaceae:4
+)Rosales:4,
+(
+'Cucurbita maxima':4,
+'Cucumis melo':4
+)Cucurbitaceae:4,
+(
+(
+'Sinapis alba':4,
+(
+'Brassica oleracea':4,
+'Brassica rapa':4,
+'Brassica napus':4,
+'Brassica juncea':4
+)Brassica:4
+)Brassicaceae:4,
+'Carica papaya':4
+)Brassicales:4,
+(
+'Theobroma cacao':4,
+'Gossypium hirsutum':4
+)Malvaceae:4,
+(
+'Diospyros kaki':4,
+'Bertholletia excelsa':4,
+(
+'Actinidia deliciosa':4,
+'Actinidia chinensis':4
+)Actinidia:4
+)Ericales:4,
+(
+'Fagopyrum esculentum':4,
+(
+(
+'Amaranthus retroflexus':4,
+'Amaranthus tricolor':4
+)Amaranthus:4,
+'Chenopodium album':4
+)Amaranthaceae:4
+)Caryophyllales:4,
+(
+(
+(
+'Carya cathayensis':4,
+'Carya illinoinensis':4
+)Carya:4,
+(
+'Juglans mandshurica':4,
+'Juglans regia':4,
+'Juglans nigra':4
+)Juglans:4
+)Juglandaceae:4,
+(
+'Ostrya carpinifolia':4,
+'Carpinus betulus':4,
+'Alnus glutinosa':4
+)Betulaceae:4,
+(
+'Fagus sylvatica':4,
+'Castanea sativa':4,
+(
+'Quercus mongolica':4,
+'Quercus ilex':4,
+'Quercus acutissima':4,
+'Quercus alba':4
+)Quercus:4
+)Fagaceae:4
+)Fagales:4,
+'Papaver somniferum':4,
+(
+(
+'Anacardium occidentale':4,
+'Pistacia vera':4
+)Anacardiaceae:4,
+(
+'Zanthoxylum bungeanum':4,
+'Citrus sinensis':4
+)Rutaceae:4
+)Sapindales:4
+)Magnoliopsida:4
+)Streptophyta:4
+)root;
