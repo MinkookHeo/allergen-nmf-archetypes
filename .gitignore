@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- Project-specific ----
+# Large SQLite database (hosted on Zenodo, not in git)
+data/*.sqlite
+data/allergen_database.sqlite
+
+# Auto-generated pipeline outputs
+results/
+figures/*.png
+figures/*.html
+!figures/assembly/          # keep the assembly scripts
+
+# Keep the provided processed matrix
+!data/allergen_source_matrix.csv
