@@ -1,6 +1,55 @@
+# -*- coding: utf-8 -*-
+"""
+Compute every statistic reported in the manuscript.
+
+Sections:
+  [1] COUNTS      descriptive statistics (Core/Ambiguous, per-archetype counts)
+  [2] BIAS        test whether repertoire entropy is an annotation artifact
+  [3] RAREFACTION entropy rank stability after equalizing sequencing depth
+  [4] AMI         archetype vs taxonomy agreement with a permutation null
+
+Rationale for [2]
+-----------------------------------------------------------------------------
+The question is whether the multi-family profile of an Ambiguous species is
+genuine biology or a by-product of the species being well studied and having
+many registered allergens.
+
+The difficulty is that every candidate proxy carries both components at once:
+feature richness, homolog count, total bitscore, and reference-allergen count
+all reflect annotation depth AND true breadth simultaneously. Peanut carrying
+Ara h 1-17 is partly a matter of fame, but also because it genuinely spans
+cupin / prolamin / PR-10 / profilin. A partial correlation controlling a
+single proxy therefore cannot separate the two components.
+
+This script instead decomposes the reference-allergen count into two parts:
+
+      n_allergens = n_families  x  allergens_per_family
+                    -----------    -------------------
+                    breadth        redundant listing
+                    (biology)      (annotation depth)
+
+Two species may each have 10 allergens, yet one has all 10 as 2S albumin
+(n_families=1, per_family=10) while the other spreads them across 6 families
+(n_families=6, per_family=1.7). The former is deep only; the latter is
+genuinely multi-family.
+
+  Test A : entropy vs n_families                     -> breadth component
+  Test B : entropy vs per_family | n_families held   -> pure depth component
+  Test C : entropy vs n_allergens | n_families held  -> alternative form of B
+
+If B and C are null, "listing depth alone does not create entropy" can be
+stated quantitatively. If B is significant, it must be moved to Limitations.
+
+Reporting principles
+  - Do not accept the null from a p-value alone; report a bootstrap 95% CI.
+  - Use TOST equivalence testing to affirm negligible magnitude.
+  - Report every correlation that reaches significance, without hiding any.
+"""
+
 import sqlite3
 import sys
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -10,7 +59,7 @@ from sklearn.metrics import adjusted_mutual_info_score
 from sklearn.preprocessing import Normalizer
 
 # ---------------------------------------------------------------------------
-# 0. 경로 / 상수 (config.py 연동)
+# 0. Paths / constants (config.py)
 # ---------------------------------------------------------------------------
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config import DB_PATH, MATRIX_PATH, RESULTS_DIR
@@ -23,24 +72,26 @@ K = 6
 RANDOM_STATE = 42
 CORE_RA_THRESHOLD = 0.80
 
-N_BOOT = 10000          
-N_PERM = 5000           
-RAREFY_REPS = 200       
+N_BOOT = 10000          # bootstrap iterations
+N_PERM = 5000           # AMI permutation iterations
+RAREFY_REPS = 200       # rarefaction iterations
 TOST_BOUNDS = (0.15, 0.20, 0.25, 0.30)
 
 _log = []
+
+
 def log(m=""):
     print(m)
     _log.append(str(m))
 
 
 def norm_name(s):
-    """'Genus species (common name)' -> 'Genus species'"""
     return str(s).split(" (")[0].strip()
 
-# ===========================================================================
-# 1. 통계 유틸
-# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Statistics utilities
+# ---------------------------------------------------------------------------
 def _residualize(rank_y, rank_Z):
     design = np.column_stack([np.ones(len(rank_y)), rank_Z])
     beta, *_ = np.linalg.lstsq(design, rank_y, rcond=None)
@@ -48,7 +99,7 @@ def _residualize(rank_y, rank_Z):
 
 
 def partial_spearman(x, y, Z=None):
-    """Spearman 편상관. Z=None 이면 단순 Spearman."""
+    """Partial Spearman correlation; simple Spearman when Z is None."""
     df = pd.DataFrame({"x": np.asarray(x, float), "y": np.asarray(y, float)})
     if Z is not None:
         Z = np.atleast_2d(np.asarray(Z, float))
@@ -70,7 +121,8 @@ def partial_spearman(x, y, Z=None):
     ry = rankdata(df["y"].to_numpy())
     RZ = np.column_stack([rankdata(df[c].to_numpy()) for c in zcols])
     ex, ey = _residualize(rx, RZ), _residualize(ry, RZ)
-    # 잔차가 상수이면 상관이 정의되지 않는다(예: 모든 종의 Per_Family 가 동일).
+    # If a residual is constant the correlation is undefined
+    # (e.g. identical Per_Family across all species).
     if np.std(ex) < 1e-12 or np.std(ey) < 1e-12:
         return np.nan, np.nan, n, len(zcols)
     rho, p = stats.pearsonr(ex, ey)
@@ -100,7 +152,7 @@ def boot_ci(x, y, Z=None, n_boot=N_BOOT, seed=0, alpha=0.05):
 
 
 def tost_equivalence(rho, n, n_ctrl=0, bound=0.25):
-    """Fisher z 기반 TOST. H0: |rho| >= bound."""
+    """Fisher z-based TOST. H0: |rho| >= bound."""
     dof = n - 3 - n_ctrl
     if dof <= 0 or not np.isfinite(rho):
         return np.nan
@@ -114,7 +166,8 @@ def tost_equivalence(rho, n, n_ctrl=0, bound=0.25):
 def report(name, rho, p, n, lo, hi, n_ctrl=0, note=""):
     log(f"  {name}")
     if not np.isfinite(rho):
-        log(f"      계산 불가 (잔차 분산 0 또는 표본 부족).  n = {n}")
+        log(f"      not computable (zero residual variance or too few samples). "
+            f"n = {n}")
         if note:
             log(f"      {note}")
         return
@@ -123,34 +176,34 @@ def report(name, rho, p, n, lo, hi, n_ctrl=0, note=""):
     cells, smallest = [], None
     for b in TOST_BOUNDS:
         pt = tost_equivalence(rho, n, n_ctrl, bound=b)
-        cells.append(f"±{b:.2f}:{pt:.3f}{'*' if pt < 0.05 else ' '}")
+        cells.append(f"\u00b1{b:.2f}:{pt:.3f}{'*' if pt < 0.05 else ' '}")
         if pt < 0.05 and smallest is None:
             smallest = b
-    log("      TOST p (등가성) " + "  ".join(cells) + "   (*=성립)")
+    log("      TOST p (equivalence) " + "  ".join(cells) + "   (* = holds)")
     if p < 0.05:
-        log("      -> 유의한 상관이 존재한다")
+        log("      -> a significant correlation is present")
     elif smallest is not None:
-        log(f"      -> 비유의 + |rho| < {smallest:.2f} 등가성 성립 "
-            f"= '무시할 수준'이라고 적극 주장 가능")
+        log(f"      -> non-significant and |rho| < {smallest:.2f} equivalence "
+            f"holds = negligible magnitude can be asserted")
     else:
-        log("      -> 비유의하지만 등가성 미성립: 검정력 부족. "
-            "'artifact 가 아니다' 라고 단정하지 말 것")
+        log("      -> non-significant but equivalence not established: "
+            "underpowered; do not claim 'not an artifact'")
     if note:
         log(f"      {note}")
 
 
-# ===========================================================================
-# 2. 종별 annotation 지표 (DB)
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# 2. Per-species annotation profile (DB)
+# ---------------------------------------------------------------------------
 def species_annotation_profile(db_path):
     """
-    종별로 다음을 집계한다.
-        N_Allergens   : WHO/IUIS reference allergen 수      (깊이 x 다면성)
-        N_Families    : 그 알레르겐들이 걸친 서로 다른 family 수  (다면성)
-        Per_Family    : N_Allergens / N_Families            (중복 등재 = 깊이)
-        N_Homologs    : 회수된 unique homolog 수
-    각 reference allergen 의 family 는 최고 bitscore homolog 의
-    CDD 복합 식별자(Superfamily|Short name)로 정의한다.
+    Aggregate per species:
+        N_Allergens : number of WHO/IUIS reference allergens  (depth x breadth)
+        N_Families  : distinct families spanned by those allergens  (breadth)
+        Per_Family  : N_Allergens / N_Families  (redundant listing = depth)
+        N_Homologs  : number of unique recovered homologs
+    Each allergen's family is defined by the CDD composite identifier
+    (Superfamily|Short name) of its highest-bitscore homolog.
     """
     q = """
     SELECT A.rowid           AS Allergen_UID,
@@ -173,7 +226,7 @@ def species_annotation_profile(db_path):
                         + rel["Short_name"].fillna("Unknown"))
     rel["Bitscore"] = pd.to_numeric(rel["Bitscore"], errors="coerce").fillna(0)
 
-    # 알레르겐 1개 -> 최고 bitscore homolog 의 family 를 그 알레르겐의 family 로
+    # One allergen -> family of its highest-bitscore homolog.
     best = (rel.sort_values("Bitscore", ascending=False)
                .drop_duplicates("Allergen_UID")[["Allergen_UID", "key", "Composite"]])
 
@@ -186,18 +239,18 @@ def species_annotation_profile(db_path):
     return prof
 
 
-# ===========================================================================
-# 3. 메인
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# 3. Main
+# ---------------------------------------------------------------------------
 def main():
-    # -------------------------------------------------- 데이터 + NMF
+    # --- data + NMF
     raw = pd.read_csv(IN_MATRIX, index_col=0)
-    log(f"[OK] 입력 행렬: {raw.shape[0]} 종 x {raw.shape[1]} feature")
+    log(f"[OK] Input matrix: {raw.shape[0]} species x {raw.shape[1]} features")
 
     zero_rows = raw.index[raw.sum(axis=1) == 0].tolist()
     if zero_rows:
-        log(f"[WARN] 할당 가능한 conserved domain 이 없는 종 "
-            f"{len(zero_rows)}개: {zero_rows}")
+        log(f"[WARN] {len(zero_rows)} species have no assignable conserved "
+            f"domain: {zero_rows}")
 
     matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
     model = NMF(n_components=K, init="nndsvda", max_iter=5000,
@@ -222,24 +275,24 @@ def main():
     # [1] COUNTS
     # ================================================================
     log("\n" + "=" * 68)
-    log("[1] COUNTS  원고 기재용 기술통계")
+    log("[1] COUNTS  descriptive statistics for the manuscript")
     log("=" * 68)
-    hybrid = (dom_ratio >= 2.0) & ((t1 >= 0.3) | (rel_ab >= 0.8))
-    log(f"  총 종 수                        : {len(raw)}")
-    log(f"  Core Member (RA >= {CORE_RA_THRESHOLD})       : {int(core.sum())}")
-    log(f"  Ambiguous                       : {int((~core).sum())}")
-    log(f"  구 하이브리드 기준과 불일치       : {int((core != hybrid).sum())} 종")
+    alt = (dom_ratio >= 2.0) & ((t1 >= 0.3) | (rel_ab >= 0.8))
+    log(f"  total species                    : {len(raw)}")
+    log(f"  Core Member (RA >= {CORE_RA_THRESHOLD})        : {int(core.sum())}")
+    log(f"  Ambiguous                        : {int((~core).sum())}")
+    log(f"  disagreement with alt. rule      : {int((core != alt).sum())} species")
     if core.any():
-        log(f"  Core 종의 최소 dominance ratio   : {dom_ratio[core].min():.3f}"
-            f"   (>= 4 이면 원고 주장과 일치)")
+        log(f"  min dominance ratio among Core   : {dom_ratio[core].min():.3f}"
+            f"   (>= 4 matches the manuscript)")
     per_arch = (pd.Series(o_idx[core, 0] + 1).value_counts()
                 .reindex(range(1, K + 1), fill_value=0).tolist())
-    log(f"  아키타입별 Core 수 1..{K}         : {per_arch}  (합 {sum(per_arch)})")
-    log(f"  second-ranked weight == 0 인 종   : {int((t2 == 0).sum())}"
-        f"   <- Figure 3 legend 수치")
-    log(f"  할당 도메인이 없는 종             : {len(zero_rows)}")
+    log(f"  Core count per archetype 1..{K}    : {per_arch}  (sum {sum(per_arch)})")
+    log(f"  species with second weight == 0  : {int((t2 == 0).sum())}"
+        f"   (Figure 3 legend value)")
+    log(f"  species with no assignable domain: {len(zero_rows)}")
 
-    # -------------------------------------------------- 종별 프로파일
+    # --- per-species profile
     df = pd.DataFrame({
         "Display_Name": raw.index,
         "Entropy": entropy,
@@ -252,95 +305,100 @@ def main():
     df["key"] = df["Display_Name"].apply(norm_name)
     df = df.join(species_annotation_profile(DB_PATH), on="key")
     n_miss = int(df["N_Allergens"].isna().sum())
-    log(f"\n  DB 종별 프로파일 매핑 완료 (미매칭 {n_miss}종)")
+    log(f"\n  Per-species DB profile mapped (unmatched: {n_miss} species)")
     for nm in df.loc[df["N_Allergens"].isna(), "Display_Name"]:
-        log(f"      미매칭: {nm}")
+        log(f"      unmatched: {nm}")
 
     # ================================================================
     # [2] BIAS
     # ================================================================
     def bias_block(sub, tag):
         log("\n" + "=" * 68)
-        log(f"[2] BIAS  annotation artifact 검정  [{tag}]  n = {len(sub)}")
+        log(f"[2] BIAS  annotation-artifact test  [{tag}]  n = {len(sub)}")
         log("=" * 68)
         e = sub["Entropy"].to_numpy()
 
-        log("\n-- (a) 단순 상관 : 전부 보고 (해석은 아래 분해 검정에서) ------")
-        log("     주의: 아래 변수들은 모두 '연구 깊이'와 '실제 다면성'을")
-        log("           동시에 담고 있어 단독으로는 해석할 수 없다.")
+        log("\n-- (a) Simple correlations: all reported "
+            "(interpretation via the decomposition below) --")
+        log("     Note: each variable below carries both annotation depth and")
+        log("           true breadth, so none can be interpreted alone.")
         for col, label in [
-                ("N_Allergens", "entropy vs reference allergen 수"),
-                ("N_Families", "entropy vs allergen family 수"),
-                ("N_Homologs", "entropy vs homolog 수"),
+                ("N_Allergens", "entropy vs number of reference allergens"),
+                ("N_Families", "entropy vs number of allergen families"),
+                ("N_Homologs", "entropy vs number of homologs"),
                 ("Feature_Richness", "entropy vs feature richness"),
-                ("Total_Bitscore", "entropy vs 총 bitscore")]:
+                ("Total_Bitscore", "entropy vs total bitscore")]:
             v = sub[col].to_numpy(float)
             r, p, n, _ = partial_spearman(e, v)
             lo, hi = boot_ci(e, v, seed=1)
             report(label, r, p, n, lo, hi)
 
-        log("\n-- (b) 분해 검정 : 다면성 성분 vs 깊이 성분 -------------------")
+        log("\n-- (b) Decomposition: breadth component vs depth component --")
         log("     n_allergens = n_families x per_family")
-        log("                   (생물학)     (중복 등재 = 깊이)")
+        log("                   (breadth)    (redundant listing = depth)")
 
         nf = sub[["N_Families"]].to_numpy(float)
 
         r, p, n, _ = partial_spearman(e, sub["N_Families"].to_numpy(float))
         lo, hi = boot_ci(e, sub["N_Families"].to_numpy(float), seed=2)
-        report("[검정 A] entropy vs family 수  (다면성 성분)", r, p, n, lo, hi,
-               note="유의할 것으로 기대됨 = repertoire 가 실제로 다면적")
+        report("[Test A] entropy vs family count  (breadth component)",
+               r, p, n, lo, hi,
+               note="expected significant = repertoire is genuinely multi-family")
 
         r, p, n, nc = partial_spearman(e, sub["Per_Family"].to_numpy(float), nf)
         lo, hi = boot_ci(e, sub["Per_Family"].to_numpy(float), nf, seed=3)
-        report("[검정 B] entropy vs family당 allergen 수 | family 수  (순수 깊이)",
+        report("[Test B] entropy vs allergens-per-family | family count  (depth)",
                r, p, n, lo, hi, n_ctrl=nc,
-               note="null 이어야 함 = 같은 다면성이면 더 많이 등재돼도 entropy 불변")
+               note="should be null = at equal breadth, more listings do not "
+                    "change entropy")
 
         r, p, n, nc = partial_spearman(e, sub["N_Allergens"].to_numpy(float), nf)
         lo, hi = boot_ci(e, sub["N_Allergens"].to_numpy(float), nf, seed=4)
-        report("[검정 C] entropy vs allergen 수 | family 수  (B의 대안 표현)",
+        report("[Test C] entropy vs allergen count | family count  (alt. form of B)",
                r, p, n, lo, hi, n_ctrl=nc)
 
-        log("\n-- (c) 판정 -------------------------------------------------")
+        log("\n-- (c) Verdict --")
         rB, pB, nB, ncB = partial_spearman(
             e, sub["Per_Family"].to_numpy(float), nf)
         eqB = min([b for b in TOST_BOUNDS
                    if tost_equivalence(rB, nB, ncB, b) < 0.05], default=None)
         rA, pA, _, _ = partial_spearman(e, sub["N_Families"].to_numpy(float))
         if not (np.isfinite(pA) and np.isfinite(pB)):
-            log("     >> 검정 A 또는 B 를 계산할 수 없다. 입력 변수 분포를 확인할 것.")
+            log("     >> Test A or B not computable; check input distributions.")
         elif pA < 0.05 and pB >= 0.05 and eqB is not None:
-            log("     >> 다면성은 entropy 를 설명하고, 등재 깊이는 설명하지 않는다.")
-            log("        원고에 'annotation depth 로 환원되지 않는다' 라고")
-            log("        정량적으로 주장 가능.")
+            log("     >> Breadth explains entropy; annotation depth does not.")
+            log("        The claim 'not reducible to annotation depth' is")
+            log("        quantitatively supported.")
         elif pB < 0.05:
-            log("     >> 등재 깊이 성분도 entropy 와 유의하게 연관된다.")
-            log("        artifact 가능성을 배제할 수 없으므로 Limitation 으로")
-            log("        내리고, 임상적 외부 타당성으로 방어할 것.")
+            log("     >> The depth component is also significantly associated")
+            log("        with entropy. An artifact cannot be excluded; move to")
+            log("        Limitations and defend with external clinical validity.")
         else:
-            log("     >> 깊이 성분이 비유의하나 등가성 미성립(검정력 부족).")
-            log("        '배제할 수 없다' 수준으로 신중하게 기술할 것.")
+            log("     >> The depth component is non-significant but equivalence")
+            log("        is not established (underpowered); describe cautiously")
+            log("        as 'cannot be excluded'.")
 
-    bias_block(df, "전체 종")
+    bias_block(df, "all species")
     if zero_rows:
         bias_block(df[~df["Display_Name"].isin(zero_rows)].reset_index(drop=True),
-                   "할당 도메인 없는 종 제외")
+                   "excluding species with no assignable domain")
 
     # ================================================================
     # [3] RAREFACTION
     # ================================================================
     log("\n" + "=" * 68)
-    log("[3] RAREFACTION  깊이 균등화 후 entropy 순위 안정성")
+    log("[3] RAREFACTION  entropy rank stability after depth equalization")
     log("=" * 68)
-    log("  목적: entropy 순위가 종별 데이터 총량 차이 때문에 생긴 것인지 확인.")
-    log("        원 entropy 와의 일치도가 높으면 깊이는 순위를 좌우하지 않는다.")
+    log("  Goal: test whether entropy ranks arise from per-species total counts.")
+    log("        High agreement with the original entropy means depth does not")
+    log("        drive the ranks.")
 
     counts = raw.to_numpy(float)
     depth = counts.sum(axis=1)
     target = int(np.floor(np.percentile(depth[depth > 0], 10)))
     keep = depth >= target
-    log(f"  목표 깊이 = {target:,} (양수 깊이 종의 10 분위수), "
-        f"대상 {int(keep.sum())} / {len(depth)} 종")
+    log(f"  target depth = {target:,} (10th percentile of positive depths), "
+        f"{int(keep.sum())} / {len(depth)} species")
 
     rng = np.random.default_rng(RANDOM_STATE)
     sub_idx = np.where(keep)[0]
@@ -360,11 +418,11 @@ def main():
 
     ok = df["Entropy_Rarefied"].notna()
     r2, p2 = stats.spearmanr(df.loc[ok, "Entropy"], df.loc[ok, "Entropy_Rarefied"])
-    log(f"  원 entropy vs rarefied entropy: rho = {r2:+.3f}, p = {p2:.3g}, "
+    log(f"  original vs rarefied entropy: rho = {r2:+.3f}, p = {p2:.3g}, "
         f"n = {int(ok.sum())}")
     if r2 > 0.9:
-        log("  -> 순위가 거의 그대로 유지된다. entropy 는 데이터 총량이 아니라")
-        log("     아키타입 가중치의 분포 형태를 반영한다.")
+        log("  -> Ranks are essentially preserved; entropy reflects the shape")
+        log("     of the archetype-weight distribution, not the total count.")
 
     rB2, pB2, nB2, ncB2 = partial_spearman(
         df.loc[ok, "Entropy_Rarefied"], df.loc[ok, "Per_Family"],
@@ -372,7 +430,7 @@ def main():
     loB2, hiB2 = boot_ci(df.loc[ok, "Entropy_Rarefied"].to_numpy(),
                          df.loc[ok, "Per_Family"].to_numpy(),
                          df.loc[ok, ["N_Families"]].to_numpy(float), seed=5)
-    report("[검정 B 재확인] rarefied entropy vs family당 allergen 수 | family 수",
+    report("[Test B re-check] rarefied entropy vs allergens-per-family | family count",
            rB2, pB2, nB2, loB2, hiB2, n_ctrl=ncB2)
 
     # ================================================================
@@ -394,7 +452,8 @@ def main():
     lab_tax = sub["Order"].astype("category").cat.codes.to_numpy()
     lab_arc = (sub["Archetype"] - 1).to_numpy()
     ami = adjusted_mutual_info_score(lab_tax, lab_arc, average_method="arithmetic")
-    log(f"  관측 AMI = {ami:.4f}  (n = {len(sub)}, orders = {sub['Order'].nunique()})")
+    log(f"  observed AMI = {ami:.4f}  (n = {len(sub)}, "
+        f"orders = {sub['Order'].nunique()})")
 
     rng2 = np.random.default_rng(RANDOM_STATE)
     null = np.array([
@@ -402,20 +461,21 @@ def main():
                                    average_method="arithmetic")
         for _ in range(N_PERM)])
     p_emp = (np.sum(null >= ami) + 1) / (N_PERM + 1)
-    log(f"  permutation null: 평균 {null.mean():+.4f}, SD {null.std():.4f}, "
-        f"95 분위 {np.percentile(null, 95):+.4f}")
-    log(f"  경험적 p = {p_emp:.4g}   z = {(ami - null.mean()) / null.std():.2f}")
+    log(f"  permutation null: mean {null.mean():+.4f}, SD {null.std():.4f}, "
+        f"95th pct {np.percentile(null, 95):+.4f}")
+    log(f"  empirical p = {p_emp:.4g}   z = {(ami - null.mean()) / null.std():.2f}")
     if p_emp < 0.05:
-        log("  -> 우연 수준보다 확실히 높으나 절대값은 낮다. 원고에")
-        log("     '유의하지만 약한 계통 신호' 라고 양쪽 다 정량 기술 가능.")
+        log("  -> Clearly above chance but small in absolute terms; report as a")
+        log("     'significant but weak phylogenetic signal'.")
     else:
-        log("  -> 우연 수준과 구별되지 않는다. '계통과 무관하다' 쪽으로 기술할 것.")
+        log("  -> Indistinguishable from chance; describe as independent of "
+            "phylogeny.")
 
-    # -------------------------------------------------- 저장
+    # --- save
     df.drop(columns=["key"]).to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
     OUT_TXT.write_text("\n".join(_log), encoding="utf-8")
-    log(f"\n[DONE] 종별 값 -> {OUT_CSV}")
-    log(f"[DONE] 로그     -> {OUT_TXT}")
+    log(f"\n[DONE] per-species values -> {OUT_CSV}")
+    log(f"[DONE] log -> {OUT_TXT}")
 
 
 if __name__ == "__main__":
