@@ -5,10 +5,11 @@ scipy>=1.9
 scikit-learn>=1.2
 openpyxl>=3.1
 
-# Figures (04 + figure assembly)
+# Figures (04)
 matplotlib>=3.6
 seaborn>=0.12
-plotly>=5.11
-kaleido>=0.2.1        # static PNG export for plotly Sankey (Figure 2C)
+plotly>=5.11        # interactive Sankey exported as standalone HTML (Figure 2c)
+pypdf>=4.0          # A4 layout / page transforms for the figure PDFs
+reportlab>=4.0      # A4 canvas and author caption
 
-# Standard library used: argparse, sqlite3, sys, time, pathlib (no install needed)
+# Standard library used: io, os, sys, time, sqlite3, argparse, pathlib
