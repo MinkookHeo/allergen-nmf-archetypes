@@ -1,12 +1,24 @@
+# -*- coding: utf-8 -*-
+"""
+Build the source-species x conserved-domain feature matrix.
+
+Reads the allergen SQLite database, joins reference allergens to their
+cross-reactive homologs and CDD conserved-domain annotations, removes
+non-food source species by exact genus matching, and writes the
+species x domain matrix used by the downstream NMF pipeline.
+
+Output: data/allergen_source_matrix.csv
+"""
+
 import sqlite3
 import sys
 from pathlib import Path
+
 import pandas as pd
 
 # ---------------------------------------------------------------------------
-# 0. 경로 설정 (config.py 연동)
+# 0. Paths (config.py)
 # ---------------------------------------------------------------------------
-# src 폴더의 상위 폴더(프로젝트 루트)에 있는 config를 불러옵니다.
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config import DB_PATH, MATRIX_PATH, RESULTS_DIR
 
@@ -14,21 +26,34 @@ OUT_MATRIX = MATRIX_PATH
 OUT_REMOVED = RESULTS_DIR / "removed_species.csv"
 OUT_SUMMARY = RESULTS_DIR / "matrix_build_summary.txt"
 
-# 대조용 이전 NMF 결과
+# Optional cross-check against a previous NMF species list (skipped if absent).
 PREV_NMF_XLSX = RESULTS_DIR / "NMF_Final_Analysis_K6_Step3_Advanced.xlsx"
 PREV_NMF_SHEET = "2_Species_Membership"
-N_REFERENCE_ALLERGENS = 1149
+
+N_REFERENCE_ALLERGENS = 1149  # total WHO/IUIS records queried
 
 if not DB_PATH.exists():
-    print(f"[ERROR] DB를 찾을 수 없습니다. data 폴더에 DB를 넣어주세요: {DB_PATH}")
+    print(f"[ERROR] Database not found. Place it in the data folder: {DB_PATH}")
     sys.exit(1)
 
-# ===========================================================================
-# 1. 데이터 로드
-# ===========================================================================
-# NOTE: Query_ID 는 GenBank accession 이다. 알레르겐 하나가 여러 accession 을
-#       가지므로 Query_ID 의 unique 개수는 알레르겐 수가 아니다.
-#       실제 알레르겐 수는 A.rowid(Allergen_UID) 로 센다.
+_log_lines = []
+
+
+def log(msg=""):
+    print(msg)
+    _log_lines.append(str(msg))
+
+
+log(f"[PATH] DB      : {DB_PATH}")
+log(f"[PATH] Results : {RESULTS_DIR}")
+
+
+# ---------------------------------------------------------------------------
+# 1. Load and assemble
+# ---------------------------------------------------------------------------
+# Query_ID is a GenBank accession. A single allergen may hold several
+# accessions, so the number of unique Query_ID values is not the allergen
+# count. Reference allergens are counted by A.rowid (Allergen_UID).
 QUERY = """
 SELECT
     A.rowid            AS Allergen_UID,
@@ -52,22 +77,22 @@ try:
     with sqlite3.connect(DB_PATH) as conn:
         merged = pd.read_sql_query(QUERY, conn)
 except Exception as e:
-    log(f"[ERROR] 데이터 로드 실패: {e}")
+    log(f"[ERROR] Failed to load data: {e}")
     sys.exit(1)
 
-log(f"[OK] 데이터 조립 완료 (행 수: {len(merged):,})")
+log(f"[OK] Data assembled ({len(merged):,} rows)")
 
 
-# ===========================================================================
-# 2. 공통 유틸
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# 2. Utilities
+# ---------------------------------------------------------------------------
 def composite_id(df):
-    """CDD Superfamily + Short name 복합 식별자."""
+    """CDD composite identifier: Superfamily + Short name."""
     return df["Superfamily"].fillna("-") + "|" + df["Short_name"].fillna("Unknown")
 
 
 def collect_stats(df):
-    """논문 Methods 에 들어갈 지표를 dict 로 반환."""
+    """Return the descriptive counts reported in Methods."""
     return {
         "pairs": len(df),
         "homologs": df["Similar_Protein"].nunique(),
@@ -79,66 +104,67 @@ def collect_stats(df):
 
 
 def report(stats, label):
-    log(f"\n--- [{label}] " + "-" * max(4, 46 - len(label)))
-    log(f"  allergen-homolog 쌍(행)      : {stats['pairs']:,}")
-    log(f"  unique homolog               : {stats['homologs']:,}")
-    log(f"  reference allergen (고유)     : {stats['allergens']:,}"
-        f"  / 질의 {N_REFERENCE_ALLERGENS:,}")
-    log(f"  GenBank accession (회수됨)    : {stats['accessions']:,}")
-    log(f"  source species               : {stats['species']:,}")
-    log(f"  conserved-domain feature     : {stats['features']:,}")
+    log(f"\n--- [{label}] " + "-" * max(4, 40 - len(label)))
+    log(f"  allergen-homolog pairs (rows) : {stats['pairs']:,}")
+    log(f"  unique homologs               : {stats['homologs']:,}")
+    log(f"  reference allergens (unique)  : {stats['allergens']:,}"
+        f"  / queried {N_REFERENCE_ALLERGENS:,}")
+    log(f"  GenBank accessions recovered  : {stats['accessions']:,}")
+    log(f"  source species                : {stats['species']:,}")
+    log(f"  conserved-domain features     : {stats['features']:,}")
 
 
 pre_stats = collect_stats(merged)
-report(pre_stats, "필터 전")
+report(pre_stats, "before filtering")
 
 if pre_stats["allergens"] > N_REFERENCE_ALLERGENS:
-    log(f"[WARN] 고유 알레르겐 수({pre_stats['allergens']:,})가 질의 수"
-        f"({N_REFERENCE_ALLERGENS:,})를 초과합니다. "
-        f"Allergens 테이블에 중복 행이 있는지 확인하세요.")
+    log(f"[WARN] Unique allergen count ({pre_stats['allergens']:,}) exceeds the "
+        f"number queried ({N_REFERENCE_ALLERGENS:,}); check for duplicate rows "
+        f"in the Allergens table.")
 
 
-# ===========================================================================
-# 3. 비식용 종 제거 (속명 정확 매칭)
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# 3. Remove non-food species (exact genus match)
+# ---------------------------------------------------------------------------
+# Matching on the genus (first token) rather than substrings avoids collateral
+# removals, e.g. "Mus" would otherwise catch Musa acuminata (banana).
 GENERA_TO_REMOVE = {
-    # 1. 벌 / 말벌 / 개미 (Hymenoptera) — 침독 알레르겐
+    # Bees / wasps / ants (Hymenoptera) - venom allergens
     "Apis", "Vespa", "Vespula", "Bombus", "Polistes", "Polybia", "Solenopsis",
     "Myrmecia", "Dolichovespula", "Anoplolepis", "Linepithema",
     "Pachycondyla",
 
-    # 2. 바퀴벌레 및 집안 해충
+    # Cockroaches and household pests
     "Blattella", "Periplaneta", "Coptotermes", "Shelfordella", "Supella",
 
-    # 3. 나방 / 누에 등
-    #    NOTE: Bombyx(누에)를 식용 곤충으로 포함하려면 아래 목록에서 제거할 것
+    # Moths / silkworm (remove Bombyx from this set to include silkworm as food)
     "Bombyx", "Plodia", "Ephestia", "Galleria", "Thaumetopoea", "Tineola",
 
-    # 4. 자상 / 환경성 / 흡혈 곤충 및 파리
+    # Biting / environmental / blood-feeding insects and flies
     "Aedes", "Anopheles", "Culex", "Glossina", "Tabanus", "Musca", "Chironomus",
     "Ctenocephalides", "Cimex", "Triatoma", "Lepisma", "Forcipomyia",
     "Arge", "Lucilia", "Sarcophaga", "Calliphora",
 
-    # 5. 진드기류 (Mites / Ticks)
+    # Mites and ticks
     "Dermatophagoides", "Tyrophagus", "Euroglyphus", "Glycyphagus",
     "Lepidoglyphus", "Blomia", "Tetranychus", "Argas", "Ixodes", "Acarus",
     "Chortoglyphus", "Sarcoptes",
 
-    # 6. 기생충 및 선충
+    # Parasites and nematodes
     "Ascaris", "Anisakis", "Trichuris", "Enterobius", "Strongyloides",
     "Schistosoma",
 
-    # 7. 곰팡이 및 효모
+    # Fungi and yeasts
     "Aspergillus", "Alternaria", "Cladosporium", "Penicillium", "Candida",
     "Cochliobolus", "Rhizopus", "Curvularia", "Stachybotrys", "Malassezia",
     "Fusarium", "Epicoccum", "Trichophyton", "Ulocladium", "Rhodotorula",
     "Saccharomyces",
 
-    # 8. 세균
+    # Bacteria
     "Bacillus", "Staphylococcus", "Streptococcus", "Escherichia", "Salmonella",
     "Listeria",
 
-    # 9. 비식용 포유류 및 인간
+    # Non-food mammals and human
     "Canis", "Felis", "Cavia", "Mesocricetus", "Phodopus", "Rattus", "Mus",
     "Homo",
 }
@@ -155,29 +181,29 @@ n_species_before = merged["Source_Species"].nunique()
 merged = merged[~mask_remove].copy()
 n_species_after = merged["Source_Species"].nunique()
 
-log(f"\n[FILTER] 종 {n_species_before} -> {n_species_after} "
-    f"({len(removed_species)}종 / {len(removed_genera)}속 제거)")
+log(f"\n[FILTER] species {n_species_before} -> {n_species_after} "
+    f"({len(removed_species)} species / {len(removed_genera)} genera removed)")
 
-# 감사 1: 제거 목록에 있으나 DB 에 존재하지 않는 속명 (오타/부재 탐지)
+# Audit 1: genera listed for removal but absent from the DB (typo / not present).
 unmatched = sorted(GENERA_TO_REMOVE - set(removed_genera))
 if unmatched:
-    log(f"[WARN] DB에서 매칭되지 않은 속명 {len(unmatched)}개 (오타/부재 확인): "
-        f"{unmatched}")
+    log(f"[WARN] {len(unmatched)} listed genera not matched in the DB "
+        f"(check for typos / absence): {unmatched}")
 
-# 감사 2: 제거된 종 목록 저장 (Supplementary 재현성용)
+# Audit 2: save the removed-species list for reproducibility.
 pd.DataFrame({
     "removed_species": removed_species,
     "genus": [s.split()[0] if s else "" for s in removed_species],
 }).to_csv(OUT_REMOVED, index=False, encoding="utf-8-sig")
-log(f"[OK] 제거된 종 목록 -> {OUT_REMOVED}")
+log(f"[OK] Removed-species list -> {OUT_REMOVED}")
 
 post_stats = collect_stats(merged)
-report(post_stats, "필터 후")
+report(post_stats, "after filtering")
 
 
-# ===========================================================================
-# 4. 표시명 / 복합 키
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# 4. Display name / composite key
+# ---------------------------------------------------------------------------
 has_common = merged["common_name"].notna() & (
     merged["common_name"].astype(str).str.strip() != ""
 )
@@ -191,9 +217,9 @@ merged["Short_name"] = merged["Short_name"].fillna("Unknown")
 merged["Composite_ID"] = merged["Superfamily"] + "|" + merged["Short_name"]
 
 
-# ===========================================================================
-# 5. 행렬 생성
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# 5. Build the matrix
+# ---------------------------------------------------------------------------
 matrix = (
     merged.groupby(["Display_Name", "Composite_ID"])["Bitscore"]
     .sum()
@@ -203,17 +229,17 @@ matrix = (
 matrix.to_csv(OUT_MATRIX, encoding="utf-8-sig")
 
 log("\n" + "=" * 62)
-log(f"[DONE] 최종 매트릭스: {matrix.shape[0]} (종) x {matrix.shape[1]} (단백질군)")
-log(f"       저장 -> {OUT_MATRIX}")
+log(f"[DONE] Final matrix: {matrix.shape[0]} species x {matrix.shape[1]} families")
+log(f"       saved -> {OUT_MATRIX}")
 log("=" * 62)
 
 
-# ===========================================================================
-# 6. 이전 NMF 결과와 종 목록 대조
-# ===========================================================================
-log("\n[대조] 이전 NMF 결과와 종 구성 비교")
+# ---------------------------------------------------------------------------
+# 6. Cross-check species composition against a previous NMF run
+# ---------------------------------------------------------------------------
+log("\n[CHECK] Compare species composition with a previous NMF run")
 if not PREV_NMF_XLSX.exists():
-    log(f"  건너뜀 - 파일 없음: {PREV_NMF_XLSX}")
+    log(f"  skipped - file not found: {PREV_NMF_XLSX}")
 else:
     try:
         prev = pd.read_excel(PREV_NMF_XLSX, sheet_name=PREV_NMF_SHEET)
@@ -223,39 +249,39 @@ else:
         added = sorted(new_set - prev_set)
         dropped = sorted(prev_set - new_set)
 
-        log(f"  이전: {len(prev_set)}종  /  현재: {len(new_set)}종")
-        log(f"  > 새로 포함된 종 ({len(added)}):")
+        log(f"  previous: {len(prev_set)} species  /  current: {len(new_set)} species")
+        log(f"  > newly included ({len(added)}):")
         for s in added:
             log(f"      + {s}")
-        log(f"  > 제외된 종 ({len(dropped)}):")
+        log(f"  > dropped ({len(dropped)}):")
         for s in dropped:
             log(f"      - {s}")
         if not added and not dropped:
-            log("      (변화 없음)")
+            log("      (no change)")
     except Exception as e:
-        log(f"  [WARN] 대조 실패: {e}")
+        log(f"  [WARN] comparison failed: {e}")
 
 
-# ===========================================================================
-# 7. 논문 Methods 용 요약
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# 7. Numbers for Methods
+# ---------------------------------------------------------------------------
 pct = post_stats["allergens"] / N_REFERENCE_ALLERGENS * 100
 
-log("\n[Methods에 그대로 넣을 숫자]")
-log(f"  reference allergens queried              : {N_REFERENCE_ALLERGENS:,}")
-log(f"  reference allergens with >=1 hit (전)     : {pre_stats['allergens']:,}")
-log(f"  reference allergens retained (후)         : {post_stats['allergens']:,} "
+log("\n[Numbers for Methods]")
+log(f"  reference allergens queried               : {N_REFERENCE_ALLERGENS:,}")
+log(f"  reference allergens with >=1 hit (pre)    : {pre_stats['allergens']:,}")
+log(f"  reference allergens retained (post)       : {post_stats['allergens']:,} "
     f"({pct:.1f}%)")
-log(f"  GenBank accessions recovered (전 -> 후)   : "
+log(f"  GenBank accessions recovered (pre -> post): "
     f"{pre_stats['accessions']:,} -> {post_stats['accessions']:,}")
-log(f"  allergen-homolog relationships (전 -> 후) : "
+log(f"  allergen-homolog relationships (pre->post): "
     f"{pre_stats['pairs']:,} -> {post_stats['pairs']:,}")
-log(f"  unique cross-reactive homologs (전 -> 후) : "
+log(f"  unique cross-reactive homologs (pre->post): "
     f"{pre_stats['homologs']:,} -> {post_stats['homologs']:,}")
-log(f"  source species (전 -> 후)                 : "
+log(f"  source species (pre -> post)              : "
     f"{pre_stats['species']:,} -> {post_stats['species']:,}")
-log(f"  conserved-domain features (전 -> 후)      : "
+log(f"  conserved-domain features (pre -> post)   : "
     f"{pre_stats['features']:,} -> {post_stats['features']:,}")
 
 OUT_SUMMARY.write_text("\n".join(_log_lines), encoding="utf-8")
-print(f"\n[OK] 실행 로그 -> {OUT_SUMMARY}")
+print(f"\n[OK] Run log -> {OUT_SUMMARY}")
