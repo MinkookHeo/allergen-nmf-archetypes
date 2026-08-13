@@ -1,6 +1,19 @@
+# -*- coding: utf-8 -*-
+"""
+Consensus NMF and selection of the number of archetypes (K).
+
+Runs consensus NMF over a range of K, computes the cophenetic correlation,
+residual sum of squares (RSS) and the delta area under the consensus CDF,
+and renders the K-selection panels together with representative consensus
+heatmaps.
+
+Output (Figure 1): figures/Figure_1.png and figures/Figure_1.pdf
+"""
+
 import sys
 import time
 from pathlib import Path
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -11,10 +24,10 @@ from sklearn.decomposition import NMF
 from sklearn.preprocessing import Normalizer
 
 # ---------------------------------------------------------------------------
-# 0. 설정 (config.py 연동 및 Allergy 가이드라인 폰트)
+# 0. Configuration (config.py; journal font settings)
 # ---------------------------------------------------------------------------
-plt.rcParams['font.family'] = 'Arial'
-plt.rcParams['font.size'] = 11
+plt.rcParams["font.family"] = "Arial"
+plt.rcParams["font.size"] = 11
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from config import MATRIX_PATH, RESULTS_DIR, FIG_DIR
@@ -22,20 +35,29 @@ from config import MATRIX_PATH, RESULTS_DIR, FIG_DIR
 CACHE_DIR = RESULTS_DIR / "consensus_cache"
 IN_MATRIX = MATRIX_PATH
 OUT_METRICS = RESULTS_DIR / "NMF_K_selection_metrics.csv"
-OUT_FIG_COMBINED = FIG_DIR / "Figure_2.png"  # 통합 그림은 figures 폴더로
+OUT_FIG_PNG = FIG_DIR / "Figure_1.png"
+OUT_FIG_PDF = FIG_DIR / "Figure_1.pdf"
 
 K_RANGE = range(2, 16)
 N_RUNS = 30
-NMF_KWARGS = dict(init="random", solver="cd", beta_loss="frobenius", tol=1e-4, max_iter=2000)
+
+NMF_KWARGS = dict(
+    init="random",
+    solver="cd",            # coordinate descent
+    beta_loss="frobenius",  # ||V - WH||_F^2
+    tol=1e-4,
+    max_iter=2000,
+)
 
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ===========================================================================
-# 1. 데이터 로드 및 전처리
-# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Load and preprocess
+# ---------------------------------------------------------------------------
 def load_processed_data(file_path):
     if not Path(file_path).exists():
-        print(f"[ERROR] 파일을 찾을 수 없습니다: {file_path}")
+        print(f"[ERROR] File not found: {file_path}")
         sys.exit(1)
     df = pd.read_csv(file_path, index_col=0)
     df_log = np.log1p(df)
@@ -43,9 +65,9 @@ def load_processed_data(file_path):
     return matrix_norm, df.columns, df.index
 
 
-# ===========================================================================
-# 2. Consensus matrix (캐시 사용)
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# 2. Consensus matrix (cached)
+# ---------------------------------------------------------------------------
 def build_consensus(matrix, k, n_runs=N_RUNS, use_cache=True):
     cache_c = CACHE_DIR / f"consensus_K{k}.npy"
     cache_r = CACHE_DIR / f"rss_K{k}.npy"
@@ -90,14 +112,15 @@ def cophenetic_corr(consensus):
     return float(coph), Z
 
 
-# ===========================================================================
-# 3. 실행
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# 3. Run
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     t0 = time.time()
 
     matrix_norm, feature_names, species_names = load_processed_data(IN_MATRIX)
-    print(f"[OK] 입력 행렬: {matrix_norm.shape[0]} 종 x {matrix_norm.shape[1]} feature")
+    print(f"[OK] Input matrix: {matrix_norm.shape[0]} species x "
+          f"{matrix_norm.shape[1]} features")
     print(f"[RUN] K={list(K_RANGE)}, runs={N_RUNS}\n")
 
     rows = []
@@ -110,7 +133,7 @@ if __name__ == "__main__":
 
     met = pd.DataFrame(rows)
 
-    # Delta area 계산
+    # Delta area under the consensus CDF
     auc = met["CDF_area"].to_numpy()
     delta = np.empty_like(auc)
     delta[0] = auc[0]
@@ -118,35 +141,39 @@ if __name__ == "__main__":
     met["delta_area"] = delta
 
     met.to_csv(OUT_METRICS, index=False, encoding="utf-8-sig")
-    print(f"\n[OK] 지표 저장 -> {OUT_METRICS}")
+    print(f"\n[OK] Metrics saved -> {OUT_METRICS}")
 
-    # =======================================================================
-    # 통합 Figure 2 생성 (3x3 레이아웃)
-    # =======================================================================
+    # -----------------------------------------------------------------------
+    # Figure 1 (3x3 layout)
+    # -----------------------------------------------------------------------
     fig, axes = plt.subplots(3, 3, figsize=(16, 16))
     k_list = met["K"]
-
-    # --- 1행: K 선정 지표 (A, B, C) ---
-    color_A, color_B, color_C = '#1B9E77', '#D95F02', '#7570B3'
+    color_A, color_B, color_C = "#1B9E77", "#D95F02", "#7570B3"
 
     # (A) Cophenetic correlation
     axes[0, 0].plot(k_list, met["cophenetic"], "o-", color=color_A, lw=2, ms=6)
-    axes[0, 0].set_xlabel("K"); axes[0, 0].set_ylabel("Cophenetic correlation coefficient")
-    axes[0, 0].text(-0.15, 1.05, "(A)", transform=axes[0, 0].transAxes, fontsize=16, fontweight="bold", va="bottom", ha="right")
+    axes[0, 0].set_xlabel("k")
+    axes[0, 0].set_ylabel("Cophenetic correlation coefficient")
+    axes[0, 0].text(-0.15, 1.05, "(A)", transform=axes[0, 0].transAxes,
+                    fontsize=16, fontweight="bold", va="bottom", ha="right")
     axes[0, 0].grid(alpha=0.3)
     axes[0, 0].set_xticks(list(k_list))
 
     # (B) RSS
     axes[0, 1].plot(k_list, met["RSS"], "o-", color=color_B, lw=2, ms=6)
-    axes[0, 1].set_xlabel("K"); axes[0, 1].set_ylabel("Residual sum of squares (RSS)")
-    axes[0, 1].text(-0.15, 1.05, "(B)", transform=axes[0, 1].transAxes, fontsize=16, fontweight="bold", va="bottom", ha="right")
+    axes[0, 1].set_xlabel("k")
+    axes[0, 1].set_ylabel("Residual sum of squares (RSS)")
+    axes[0, 1].text(-0.15, 1.05, "(B)", transform=axes[0, 1].transAxes,
+                    fontsize=16, fontweight="bold", va="bottom", ha="right")
     axes[0, 1].grid(alpha=0.3)
     axes[0, 1].set_xticks(list(k_list))
 
     # (C) Delta area
     axes[0, 2].plot(k_list, met["delta_area"], "o-", color=color_C, lw=2, ms=6)
-    axes[0, 2].set_xlabel("K"); axes[0, 2].set_ylabel("Delta area under consensus CDF")
-    axes[0, 2].text(-0.15, 1.05, "(C)", transform=axes[0, 2].transAxes, fontsize=16, fontweight="bold", va="bottom", ha="right")
+    axes[0, 2].set_xlabel("k")
+    axes[0, 2].set_ylabel("Delta area under consensus CDF")
+    axes[0, 2].text(-0.15, 1.05, "(C)", transform=axes[0, 2].transAxes,
+                    fontsize=16, fontweight="bold", va="bottom", ha="right")
     axes[0, 2].grid(alpha=0.3)
     axes[0, 2].set_xticks(list(k_list))
 
@@ -154,47 +181,45 @@ if __name__ == "__main__":
     sns.despine(ax=axes[0, 1])
     sns.despine(ax=axes[0, 2])
 
-    # --- 2행 및 3행: Consensus 히트맵 (D) ---
-    # 비대화형(재현) 실행에서는 입력을 생략하고 논문 기본값 K=3~8을 쓴다.
+    # (D) Consensus heatmaps (rows 2-3). Non-interactive default: K = 3..8.
     try:
         k_input = input(
-            "\n히트맵으로 확인할 K값 입력 (공백 구분, 기본값 K=3~8은 그냥 엔터): "
+            "\nK values for heatmaps (space-separated; Enter for default 3-8): "
         ).strip()
     except (EOFError, OSError):
         k_input = ""
     target_ks = [int(v) for v in k_input.split()] if k_input else [3, 4, 5, 6, 7, 8]
 
-    # 히트맵을 그릴 6개의 축(axes) 평탄화 추출 (2행과 3행)
     heatmap_axes = axes[1:, :].flatten()
 
     for i, k in enumerate(target_ks):
         if i >= len(heatmap_axes):
-            break # 3x3 배열을 초과하는 경우 방지
+            break
 
-        consensus, _ = build_consensus(matrix_norm, k)   
+        consensus, _ = build_consensus(matrix_norm, k)
         _, Z = cophenetic_corr(consensus)
         order = leaves_list(Z)
-        
+
         sns.heatmap(
             consensus[np.ix_(order, order)],
             ax=heatmap_axes[i], cmap="YlGnBu", vmin=0, vmax=1,
             cbar=False, xticklabels=False, yticklabels=False,
         )
-        
-        # 첫 번째 히트맵(K=3) 좌상단에만 대표 패널 라벨 (D) 삽입
-        if i == 0:
-            heatmap_axes[i].text(-0.05, 1.05, "(D)", transform=heatmap_axes[i].transAxes, fontsize=16, fontweight="bold", va="bottom", ha="right")
-        
-        heatmap_axes[i].set_title(f"K = {k}", pad=10)
 
-    # 비어 있는 축이 있다면(target_ks가 6개 미만일 때) 숨김 처리
+        if i == 0:
+            heatmap_axes[i].text(-0.05, 1.05, "(D)",
+                                 transform=heatmap_axes[i].transAxes,
+                                 fontsize=16, fontweight="bold",
+                                 va="bottom", ha="right")
+        heatmap_axes[i].set_title(f"k = {k}", pad=10)
+
     for j in range(len(target_ks), len(heatmap_axes)):
         heatmap_axes[j].axis("off")
 
     plt.tight_layout()
-    # 하나의 Figure로 600 dpi 저장
-    plt.savefig(OUT_FIG_COMBINED, dpi=600, bbox_inches="tight")
-    print(f"\n[OK] 3x3 통합 Figure 저장 완료 -> {OUT_FIG_COMBINED}")
+    plt.savefig(OUT_FIG_PNG, dpi=600, bbox_inches="tight")
+    plt.savefig(OUT_FIG_PDF, bbox_inches="tight")
+    print(f"\n[OK] Figure 1 saved -> {OUT_FIG_PNG} / {OUT_FIG_PDF}")
     plt.close()
 
-    print(f"\n[DONE] 총 소요: {time.time() - t0:.1f}초")
+    print(f"\n[DONE] Elapsed: {time.time() - t0:.1f}s")
