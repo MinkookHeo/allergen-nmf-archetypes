@@ -1,354 +1,500 @@
 # -*- coding: utf-8 -*-
 """
-04_Figure_Generation.py
+Generate the panels of Figure 2 and assemble them.
 
-204종 x 840 feature 매트릭스로부터 NMF(K=6)를 재현하고,
-논문 그림을 생성한다.
+Builds each panel (A-D) as a reusable module, then renders the individual
+items (Figure 2a, 2c, 2d) and the combined Figure 2, and applies A4
+formatting with an author caption. Statistical tests are not computed here;
+see 05_statistical_analysis.py.
 
-  * 통계 검정(AMI, 편상관 등)은 이 파일에서 분리되어
-    05_statistical_analysis.py 로 이동했다.
-    이 파일은 그림과 그림의 원본 데이터만 만든다.
-
-핵심 원칙
-  - Core/Ambiguous 판정은 원고 2.4 의 단일 기준을 사용한다.
-        is_core = (Relative_Abundance >= 0.80)
-    이전 버전은 하이브리드 기준
-        (DR >= 2.0) AND (Top1_Weight >= 0.3 OR RA >= 0.8)
-    을 썼으나, 두 기준은 본 데이터에서 완전히 동일한 분할을 준다
-    (RA >= 0.80 이면 DR >= 4 가 수학적으로 강제되므로).
-    스크립트가 실행 시 두 기준의 일치를 자동 검증한다.
-  - Archetype 번호는 1..6 (내부 cluster 0..5 + 1)
-
-생성물 (모두 Results_Figures/)
-  Figure1_family_order_barplot.png      : Top10 order / family / protein-family
-  Figure3_dominance_landscape.png       : dominance landscape
-  Figure4_compositional_fingerprint.png : compositional fingerprint
-  Figure5_sankey_taxonomy.html          : alluvial
-  figure_source_data.csv                : 그림 원본 데이터
-  figure_generation_log.txt             : 실행 로그
-
-  주: 원고 개정으로 display item 을 9 -> 6 개로 줄이면서 그림 번호가
-      바뀌었다. 아래 FIGNUM 으로 관리한다.
-        구 Figure 4 -> 신 Figure 3 (dominance landscape)
-        구 Figure 5 -> 신 Figure 4 (fingerprint)
-        구 Figure 6 -> 신 Figure 5 (alluvial)
-
-의존성: pandas numpy scikit-learn matplotlib seaborn plotly
+Panels:
+    A  Top-10 taxonomic orders / families / conserved protein families
+    B  Compositional fingerprint of regulated representative species
+    C  Order-to-archetype alluvial (native matplotlib and Plotly HTML)
+    D  Dominance landscape (relative abundance vs dominance ratio)
 """
 
+import io
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+from matplotlib.patches import PathPatch, Rectangle, Patch
+from matplotlib.path import Path as MplPath
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import seaborn as sns
+import plotly.graph_objects as go
 from sklearn.decomposition import NMF
 from sklearn.preprocessing import Normalizer
 
-# ===========================================================================
-# 0. 경로 / 상수 (config.py 연동)
-# ===========================================================================
-import sys
+from pypdf import PdfReader, PdfWriter, Transformation
+from reportlab.pdfgen import canvas
+from reportlab.lib.colors import white, black
+
+# ---------------------------------------------------------------------------
+# 0. Paths / constants and colors (config.py)
+# ---------------------------------------------------------------------------
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from config import DB_PATH, MATRIX_PATH, RESULTS_DIR, FIG_DIR
+from config import DB_PATH, MATRIX_PATH, FIG_DIR
 
 IN_MATRIX = MATRIX_PATH
-FIGDIR = FIG_DIR  # 개별 그림 저장 위치
+FIGDIR = FIG_DIR
+A4DIR = FIGDIR / "A4_formatted"
 
 K = 6
 RANDOM_STATE = 42
 
-# 원고 개정 후 그림 번호 (구 번호 -> 신 번호)
-FIGNUM = {
-    "barplot": 1,      # 구 Figure 1
-    "landscape": 3,    # 구 Figure 4
-    "fingerprint": 4,  # 구 Figure 5
-    "alluvial": 5,     # 구 Figure 6
-}
+# CVD-safe (Okabe-Ito) palette
+ARCH_HEX = ['#0072B2', '#D55E00', '#56B4E9', '#E69F00', '#009E73', '#F0E442']
+ARCH_RGBA = ['rgba(0,114,178,0.5)', 'rgba(213,94,0,0.5)', 'rgba(86,180,233,0.5)',
+             'rgba(230,159,0,0.5)', 'rgba(0,158,115,0.5)', 'rgba(240,228,66,0.5)']
+CORE_COLOR = '#D55E00'
+AMB_COLOR = '#0072B2'
 
 FIGDIR.mkdir(parents=True, exist_ok=True)
+A4DIR.mkdir(parents=True, exist_ok=True)
 
-_log = []
 
-
-def log(m=""):
-    print(m)
-    _log.append(str(m))
+def cap_first(s):
+    s = str(s)
+    return s[:1].upper() + s[1:] if s else s
 
 
 def norm_name(s):
     return str(s).split(" (")[0].strip()
 
 
-# ===========================================================================
-# 1. 로드 + 전처리 + NMF
-# ===========================================================================
-raw = pd.read_csv(IN_MATRIX, index_col=0)
-species_names = raw.index
-feature_names = raw.columns
-
-_zero = raw.index[raw.sum(axis=1) == 0].tolist()
-if _zero:
-    log(f"[WARN] 할당 가능한 conserved domain 이 없는 종 {len(_zero)}개: {_zero}")
-    log("       이 종들은 W 행이 0 이 되어 자동으로 Ambiguous 로 분류된다.")
-    log("       원고 Results/Limitations 에 명시할 것.")
-
-matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
-
-model = NMF(n_components=K, init="nndsvda", max_iter=5000,
-            random_state=RANDOM_STATE)
-W = model.fit_transform(matrix_norm)
-H = model.components_
-log(f"[OK] NMF K={K}: W{W.shape}, H{H.shape}")
-
-order_idx = np.argsort(W, axis=1)[:, ::-1]
-top1_idx = order_idx[:, 0]
-top2_idx = order_idx[:, 1]
-top1_w = np.take_along_axis(W, top1_idx[:, None], axis=1).squeeze()
-top2_w = np.take_along_axis(W, top2_idx[:, None], axis=1).squeeze()
-
-eps = 1e-9
-dominance_ratio = top1_w / (top2_w + eps)
-row_sum = W.sum(axis=1)
-relative_abundance = top1_w / np.where(row_sum == 0, 1, row_sum)
-
-# --- 단일 기준 (원고 2.4와 동일): 상대 비중 >= 0.80 ---
-is_core = relative_abundance >= 0.80
-status = np.where(is_core, "Core Member", "Ambiguous")
-
-# 이전 하이브리드 기준과 결과가 동일한지 자체 검증
-_hybrid = (dominance_ratio >= 2.0) & ((top1_w >= 0.3) | (relative_abundance >= 0.8))
-_n_diff = int((is_core != _hybrid).sum())
-log(f"[CHECK] 단일 기준 vs 이전 하이브리드 기준 불일치 종: {_n_diff}")
-if _n_diff == 0:
-    _min_dr = float(dominance_ratio[is_core].min())
-    log(f"        두 기준이 동일한 분할을 준다. "
-        f"Core 종의 최소 dominance ratio = {_min_dr:.3f} (>= 4 이면 이론과 일치)")
-else:
-    log("[WARN] 두 기준이 다른 결과를 준다. 원고 기술을 재확인할 것.")
-
-df = pd.DataFrame({
-    "Display_Name": species_names,
-    "Primary_Cluster": top1_idx,
-    "Archetype": top1_idx + 1,               # 1..6
-    "Top1_Weight": top1_w,
-    "Top2_Weight": top2_w,
-    "Relative_Abundance": relative_abundance,
-    "Dominance_Ratio": dominance_ratio,
-    "Membership_Status": status,
-})
-for i in range(K):
-    df[f"Weight_A{i+1}"] = W[:, i]
-
-log(f"[OK] Core {int(is_core.sum())} / Ambiguous {int((~is_core).sum())}")
-per_arch = df[df.Membership_Status == "Core Member"]["Archetype"].value_counts().sort_index()
-log(f"     Core per Archetype 1..6: {per_arch.reindex(range(1,7), fill_value=0).tolist()}")
+# ---------------------------------------------------------------------------
+# Font (Arial / Helvetica)
+# ---------------------------------------------------------------------------
+def set_journal_font():
+    preferred = ["Arial", "Helvetica", "Liberation Sans"]
+    available = {f.name for f in fm.fontManager.ttflist}
+    for name in preferred:
+        if name in available:
+            plt.rcParams["font.family"] = name
+            return
+    plt.rcParams["font.family"] = "sans-serif"
 
 
-# ===========================================================================
-# 2. Taxonomy 매핑 (괄호 앞 학명 기준, Not Found 최소화)
-# ===========================================================================
-with sqlite3.connect(DB_PATH) as conn:
-    tax = pd.read_sql_query(
-        "SELECT Species, [Order] AS Ord, Family FROM SpeciesTaxonomy", conn)
-
-tax["key"] = tax["Species"].apply(norm_name)
-valid = ~tax["Ord"].isin(["Not Found", "Unknown", None])
-map_order = tax[valid].drop_duplicates("key").set_index("key")["Ord"]
-map_family = tax[valid].drop_duplicates("key").set_index("key")["Family"]
-
-df["key"] = df["Display_Name"].apply(norm_name)
-df["Order"] = df["key"].map(map_order)
-df["Family"] = df["key"].map(map_family)
-
-n_nf = df["Order"].isna().sum()
-log(f"[OK] taxonomy 매핑: Order 미매칭 {n_nf}종")
-for nm in df.loc[df["Order"].isna(), "Display_Name"]:
-    log(f"      미매칭: {nm}")
+set_journal_font()
+plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams["font.weight"] = "normal"
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
 
 
-# ===========================================================================
-# 3. Figure 1 : Top10 막대 (order / family / protein-family)
-# ===========================================================================
-def fig_dataset_overview():
-    """
-    homolog 데이터 기반 Top10 막대.
-    Crossreactivity(homolog) 각각의 출처 종 -> Order/Family, 그리고
-    homolog의 conserved-domain family 분포.
-    """
+# ---------------------------------------------------------------------------
+# 1. Data pipeline (single source of truth)
+# ---------------------------------------------------------------------------
+def prepare_data():
+    raw = pd.read_csv(IN_MATRIX, index_col=0)
+    matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
+
+    model = NMF(n_components=K, init="nndsvda", max_iter=5000,
+                random_state=RANDOM_STATE)
+    W = model.fit_transform(matrix_norm)
+
+    order_idx = np.argsort(W, axis=1)[:, ::-1]
+    top1_idx, top2_idx = order_idx[:, 0], order_idx[:, 1]
+    top1_w = np.take_along_axis(W, top1_idx[:, None], axis=1).squeeze()
+    top2_w = np.take_along_axis(W, top2_idx[:, None], axis=1).squeeze()
+
+    eps = 1e-9
+    dominance_ratio = top1_w / (top2_w + eps)
+    row_sum = W.sum(axis=1)
+    relative_abundance = top1_w / np.where(row_sum == 0, 1, row_sum)
+
+    is_core = relative_abundance >= 0.80
+    status = np.where(is_core, "Core Member", "Ambiguous")
+
+    df_nmf = pd.DataFrame({
+        "Display_Name": raw.index,
+        "Primary_Cluster": top1_idx,
+        "Archetype": top1_idx + 1,
+        "Relative_Abundance": relative_abundance,
+        "Dominance_Ratio": dominance_ratio,
+        "Membership_Status": status,
+    })
+    for i in range(K):
+        df_nmf[f"Weight_A{i+1}"] = W[:, i]
+
     with sqlite3.connect(DB_PATH) as conn:
+        tax = pd.read_sql_query(
+            "SELECT Species, [Order] AS Ord, Family FROM SpeciesTaxonomy", conn)
         cr = pd.read_sql_query(
-            'SELECT Query_ID, Similar_Protein FROM Crossreactivity', conn)
+            "SELECT Query_ID, Similar_Protein FROM Crossreactivity", conn)
         pf = pd.read_sql_query(
             'SELECT Query, Superfamily, "Short name" AS Short_name '
             'FROM Protein_families', conn)
-        alg = pd.read_sql_query(
-            'SELECT genbank_ids, species FROM Allergens', conn)
-        taxa = pd.read_sql_query(
-            'SELECT Species, [Order] AS Ord, Family FROM SpeciesTaxonomy', conn)
+        alg = pd.read_sql_query("SELECT genbank_ids, species FROM Allergens", conn)
 
-    # homolog의 conserved-domain family 분포
+    tax["key"] = tax["Species"].apply(norm_name)
+    valid = ~tax["Ord"].isin(["Not Found", "Unknown", None])
+    map_order = tax[valid].drop_duplicates("key").set_index("key")["Ord"]
+    map_family = tax[valid].drop_duplicates("key").set_index("key")["Family"]
+
+    df_nmf["key"] = df_nmf["Display_Name"].apply(norm_name)
+    df_nmf["Order"] = df_nmf["key"].map(map_order)
+    df_nmf["Family"] = df_nmf["key"].map(map_family)
+
     pf["Superfamily"] = pf["Superfamily"].fillna("-")
     pf["Short_name"] = pf["Short_name"].fillna("Unknown")
     pf["combo"] = pf["Superfamily"] + "|" + pf["Short_name"]
     hom = cr.merge(pf, left_on="Similar_Protein", right_on="Query", how="left")
     top_protfam = hom["combo"].value_counts().head(10)
 
-    # homolog 출처 종의 order/family (레퍼런스 알레르겐 종 기준)
-    # genbank_ids 를 분해해 Query_ID 와 매칭
     alg2 = alg.assign(gid=alg["genbank_ids"].str.split(";")).explode("gid")
     alg2["gid"] = alg2["gid"].str.strip()
     cr2 = cr.merge(alg2, left_on="Query_ID", right_on="gid", how="left")
-    taxa["key"] = taxa["Species"].apply(norm_name)
     cr2["key"] = cr2["species"].apply(lambda x: norm_name(x) if pd.notna(x) else x)
-    cr2 = cr2.merge(taxa[["key", "Ord", "Family"]].drop_duplicates("key"),
+    cr2 = cr2.merge(tax[["key", "Ord", "Family"]].drop_duplicates("key"),
                     on="key", how="left")
-    valid_o = cr2[~cr2["Ord"].isin(["Not Found", "Unknown", None])]
-    top_order = valid_o["Ord"].value_counts().head(10)
-    valid_f = cr2[~cr2["Family"].isin(["Not Found", "Unknown", None])]
-    top_family = valid_f["Family"].value_counts().head(10)
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    for ax, ser, title, color in [
-        (axes[0], top_order, "Top 10 taxonomic orders", "#4c78a8"),
-        (axes[1], top_family, "Top 10 taxonomic families", "#54a24b"),
-        (axes[2], top_protfam, "Top 10 conserved protein families", "#e45756"),
-    ]:
-        ser = ser[::-1]
-        ax.barh(range(len(ser)), ser.values, color=color)
-        ax.set_yticks(range(len(ser)))
-        ax.set_yticklabels(ser.index, fontsize=9)
-        ax.set_title(title)
-        ax.set_xlabel("Number of homologs")
-    plt.tight_layout()
-    out = FIGDIR / f"Figure{FIGNUM['barplot']}_family_order_barplot.png"
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    log(f"[OK] Figure {FIGNUM['barplot']} (barplot) -> {out}")
+    top_order = cr2[~cr2["Ord"].isin(["Not Found", "Unknown", None])]["Ord"].value_counts().head(10)
+    top_family = cr2[~cr2["Family"].isin(["Not Found", "Unknown", None])]["Family"].value_counts().head(10)
 
-    # 캡션용 총 개수
-    log(f"     homolog 총계로 본 order={cr2[~cr2['Ord'].isin(['Not Found','Unknown',None])]['Ord'].nunique()}, "
-        f"family={cr2[~cr2['Family'].isin(['Not Found','Unknown',None])]['Family'].nunique()}, "
-        f"protein-family(combo)={hom['combo'].nunique()}")
+    top_order.index = [cap_first(x) for x in top_order.index]
+    top_family.index = [cap_first(x) for x in top_family.index]
+
+    df_nmf.to_csv(FIGDIR / "figure_source_data.csv", index=False,
+                  encoding="utf-8-sig")
+
+    return df_nmf, top_order, top_family, top_protfam
 
 
-# ===========================================================================
-# 4. Figure 4 : Dominance landscape (하이브리드 기준)
-# ===========================================================================
-def fig_dominance_landscape():
-    fig, ax = plt.subplots(figsize=(8, 8))
-    sns.scatterplot(
-        data=df, x="Relative_Abundance", y="Dominance_Ratio",
-        hue="Membership_Status",
-        palette={"Core Member": "#e74c3c", "Ambiguous": "#3498db"},
-        alpha=0.75, edgecolor="k", s=60, ax=ax,
-    )
-    # 분류 기준은 RA >= 0.80 단 하나 (세로 파선).
-    # DR >= 4 는 그로부터 수학적으로 강제되는 결과일 뿐이므로 점선으로 구분 표시.
-    ax.axvline(0.80, color="gray", ls="--", lw=1.5, zorder=0,
-               label="Core Member threshold (RA = 0.80)")
-    ax.axhline(4.0, color="gray", ls=":", lw=1.2, zorder=0,
-               label="Implied bound (DR = 4)")
-    ax.set_yscale("log")
-    ax.set_title("The Dominance Landscape")
-    ax.set_xlabel("Relative abundance of primary archetype")
-    ax.set_ylabel("Dominance ratio (Top 1 / Top 2 weight, log scale)")
-    plt.tight_layout()
-    out = FIGDIR / f"Figure{FIGNUM['landscape']}_dominance_landscape.png"
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close()
-    log(f"[OK] Figure {FIGNUM['landscape']} (dominance landscape) -> {out}")
+# ---------------------------------------------------------------------------
+# 2. Panel modules
+# ---------------------------------------------------------------------------
+def draw_panel_A(axes, top_order, top_family, top_protfam, is_individual=False):
+    sns.barplot(x=top_order.values, y=top_order.index, color=ARCH_HEX[0], ax=axes[0])
+    axes[0].set_xlabel('Number of species'); axes[0].set_ylabel('')
+    for lbl in axes[0].get_yticklabels():
+        lbl.set_fontstyle('italic')
+
+    sns.barplot(x=top_family.values, y=top_family.index, color=ARCH_HEX[1], ax=axes[1])
+    axes[1].set_xlabel('Number of species'); axes[1].set_ylabel('')
+    for lbl in axes[1].get_yticklabels():
+        lbl.set_fontstyle('italic')
+
+    sns.barplot(x=top_protfam.values, y=top_protfam.index, color=ARCH_HEX[2], ax=axes[2])
+    axes[2].set_xlabel('Number of homologs'); axes[2].set_ylabel('')
+
+    for ax in axes:
+        ax.spines[["top", "right"]].set_visible(False)
+
+    if is_individual:
+        axes[0].set_title("Top 10 taxonomic orders")
+        axes[1].set_title("Top 10 taxonomic families")
+        axes[2].set_title("Top 10 conserved protein families")
+    else:
+        axes[0].text(-0.05, 1.05, '(A)', transform=axes[0].transAxes,
+                     fontsize=18, va='bottom', ha='right')
 
 
-# ===========================================================================
-# 5. Figure 5 : Compositional fingerprint
-# ===========================================================================
-def fig_compositional_fingerprint():
-    targets = [
-        "Gadus morhua (Atlantic cod)",
-        "Litopenaeus vannamei (Pacific white shrimp)",
-        "Betula verrucosa (Betula pendula)",
-        "Malus domestica (apple)",
-        "Corylus avellana (European hazelnut)",
-        "Prunus avium (Sweet cherry)",
-        "Arachis hypogaea (Peanut)",
+def draw_panel_B(ax, df_nmf, is_individual=False):
+    REGULATED_REPS = [
+        ("Anacardium occidentale",      "Cashew"),
+        ("Sesamum indicum",             "Sesame"),
+        ("Brassica juncea",             "Brown mustard"),
+        ("Litopenaeus vannamei",        "Pacific white shrimp"),
+        ("Octopus vulgaris",            "Common octopus"),
+        ("Lupinus angustifolius",       "Lupin"),
+        ("Triticum turgidum ssp durum", "Durum wheat"),
+        ("Castanea sativa",             "Chestnut"),
+        ("Gadus morhua",                "Atlantic cod"),
     ]
-    d = df[df["Display_Name"].isin(targets)].copy()
     wc = [f"Weight_A{i+1}" for i in range(K)]
-    d[wc] = d[wc].div(d[wc].sum(axis=1), axis=0)
-    d = d.sort_values("Membership_Status", ascending=False)
+    rows_b = []
+    for key, label in REGULATED_REPS:
+        m = df_nmf[df_nmf["Display_Name"].str.contains(key, na=False, regex=False)]
+        if m.empty:
+            continue
+        r = m.iloc[0]; w = r[wc].to_numpy(dtype=float)
+        frac = w / w.sum()
+        dr = r["Dominance_Ratio"]; dr_str = "> 10\u00b3" if dr > 1000 else f"{dr:.1f}"
+        rows_b.append((label, frac, dr_str, float(frac.max())))
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bottom = np.zeros(len(d))
-    colors = plt.cm.Set2(np.linspace(0, 1, K))
-    for i, col in enumerate(wc):
-        ax.barh(d["Display_Name"], d[col], left=bottom, color=colors[i],
-                label=f"Archetype {i+1}")
-        bottom += d[col].to_numpy()
-    for idx, (_, row) in enumerate(d.iterrows()):
-        ax.text(1.01, idx, f" D.R: {row['Dominance_Ratio']:.1f}",
-                va="center", fontsize=10)
-    ax.set_title("Compositional Fingerprint of Clinical Model Species", pad=20)
-    ax.set_xlabel("Relative archetype contribution")
-    ax.set_xlim(0, 1)
-    ax.legend(bbox_to_anchor=(1.2, 1), loc="upper left")
+    rows_b.sort(key=lambda x: x[3])
+    for i, (label, frac, dr_str, _) in enumerate(rows_b):
+        left = 0.0
+        for a in range(K):
+            if frac[a] > 0:
+                ax.barh(i, frac[a], left=left, color=ARCH_HEX[a],
+                        edgecolor="white", linewidth=0.6, height=0.62)
+                left += frac[a]
+        ax.text(1.02, i, f"D.R: {dr_str}", va="center", ha="left", fontsize=11)
+
+    ax.set_yticks(range(len(rows_b)))
+    ax.set_yticklabels([r[0] for r in rows_b], fontsize=10)
+    ax.set_xlim(0, 1.0)
+    ax.set_xlabel("Relative Archetype Contribution", fontsize=11)
+
+    handles = [Patch(facecolor=ARCH_HEX[a], label=f"Archetype {a+1}") for a in range(K)]
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.15),
+              ncol=3, frameon=False, fontsize=9)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    if not is_individual:
+        ax.text(-0.05, 1.05, '(B)', transform=ax.transAxes,
+                fontsize=18, va='bottom', ha='right')
+
+
+def _ribbon(ax, xL, xR, l_top, l_bot, r_top, r_bot, color, alpha=0.5):
+    cx = (xL + xR) / 2.0
+    verts = [(xL, l_top), (cx, l_top), (cx, r_top), (xR, r_top), (xR, r_bot),
+             (cx, r_bot), (cx, l_bot), (xL, l_bot), (xL, l_top)]
+    codes = [MplPath.MOVETO, MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4,
+             MplPath.LINETO, MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4,
+             MplPath.CLOSEPOLY]
+    ax.add_patch(PathPatch(MplPath(verts, codes), facecolor=color,
+                           edgecolor="none", alpha=alpha))
+
+
+def draw_panel_C_native(ax, df_nmf, is_individual=False):
+    target_orders = ["Poales", "Rosales", "Fagales", "Fabales", "Asterales",
+                     "Malpighiales", "Lamiales", "Malvales", "Zingiberales"]
+    sub = df_nmf[df_nmf["Order"].isin(target_orders)]
+    agg = sub.groupby(["Order", "Archetype"]).size().reset_index(name="Count")
+    if agg.empty:
+        ax.axis("off"); return
+
+    orders = [o for o in target_orders if o in set(agg["Order"])]
+    arch_list = sorted(int(a) for a in agg["Archetype"].unique())
+    total = float(agg["Count"].sum())
+    order_tot = agg.groupby("Order")["Count"].sum()
+    arch_tot = agg.groupby("Archetype")["Count"].sum()
+
+    gap = 0.03
+    nL, nR = len(orders), len(arch_list)
+    scale = min((1 - gap * (nL - 1)) / total, (1 - gap * (nR - 1)) / total)
+
+    def node_pos(items, totals, n):
+        used = total * scale + gap * (n - 1)
+        y = 1 - (1 - used) / 2.0
+        pos = {}
+        for it in items:
+            h = float(totals[it]) * scale
+            pos[it] = [y, y - h]
+            y -= h + gap
+        return pos
+
+    posL = node_pos(orders, order_tot, nL)
+    posR = node_pos(arch_list, arch_tot, nR)
+
+    xL0, xL1, xR0, xR1 = 0.00, 0.03, 0.97, 1.00
+    offL = {o: posL[o][0] for o in orders}
+    offR = {a: posR[a][0] for a in arch_list}
+
+    for o in orders:
+        rows = agg[agg["Order"] == o].sort_values("Archetype")
+        for _, r in rows.iterrows():
+            a = int(r["Archetype"]); h = float(r["Count"]) * scale
+            lt = offL[o]; lb = lt - h; offL[o] = lb
+            rt = offR[a]; rb = rt - h; offR[a] = rb
+            _ribbon(ax, xL1, xR0, lt, lb, rt, rb, ARCH_HEX[a - 1], alpha=0.5)
+
+    for o in orders:
+        t, b = posL[o]
+        ax.add_patch(Rectangle((xL0, b), xL1 - xL0, t - b,
+                               facecolor="lightgrey", edgecolor="none"))
+        ax.text(xL0 - 0.02, (t + b) / 2, cap_first(o), ha="right", va="center",
+                fontsize=11, fontstyle="italic")
+    for a in arch_list:
+        t, b = posR[a]
+        ax.add_patch(Rectangle((xR0, b), xR1 - xR0, t - b,
+                               facecolor=ARCH_HEX[a - 1], edgecolor="none"))
+        ax.text(xR1 + 0.02, (t + b) / 2, f"Archetype {a}", ha="left",
+                va="center", fontsize=11)
+
+    ax.set_xlim(-0.18, 1.18)
+    ax.set_ylim(-0.02, 1.02)
+    ax.axis("off")
+
+    if not is_individual:
+        ax.text(-0.05, 1.05, '(C)', transform=ax.transAxes,
+                fontsize=18, va='bottom', ha='right')
+
+
+def draw_panel_D(ax, df_nmf, is_individual=False):
+    sns.scatterplot(data=df_nmf, x="Relative_Abundance", y="Dominance_Ratio",
+                    hue="Membership_Status",
+                    palette={"Core Member": CORE_COLOR, "Ambiguous": AMB_COLOR},
+                    alpha=0.75, edgecolor="k", s=60, ax=ax)
+    ax.axvline(0.80, color="gray", ls="--", lw=1.5, zorder=0)
+    ax.set_yscale("log")
+    ax.set_xlabel("Relative abundance of primary archetype\n(Core if \u2265 0.8)")
+    ax.set_ylabel("Dominance ratio (log scale)")
+    ax.get_legend().remove()
+    ax.text(0.90, ax.get_ylim()[1] * 0.4, "Core\n(single-family dominant)",
+            color=CORE_COLOR, fontsize=11, ha="center", va="top")
+    ax.text(0.35, 10**3, "Ambiguous\n(multi-family)",
+            color=AMB_COLOR, fontsize=11, ha="center", va="bottom")
+    ax.spines[["top", "right"]].set_visible(False)
+
+    if is_individual:
+        ax.set_title("The Dominance Landscape")
+    else:
+        ax.text(-0.05, 1.05, '(D)', transform=ax.transAxes,
+                fontsize=18, va='bottom', ha='right')
+
+
+# ---------------------------------------------------------------------------
+# 3. Figure assembly
+# ---------------------------------------------------------------------------
+def create_figure_2a_independent(top_order, top_family, top_protfam):
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    draw_panel_A(axes, top_order, top_family, top_protfam, is_individual=True)
     plt.tight_layout()
-    out = FIGDIR / f"Figure{FIGNUM['fingerprint']}_compositional_fingerprint.png"
-    plt.savefig(out, dpi=300, bbox_inches="tight")
+    out_pdf = FIGDIR / "Figure_2(a)_raw.pdf"
+    plt.savefig(out_pdf, bbox_inches="tight")
     plt.close()
-    log(f"[OK] Figure {FIGNUM['fingerprint']} (fingerprint) -> {out}")
+    return out_pdf
 
 
-# ===========================================================================
-# 6. Figure 6 : Sankey/alluvial
-# ===========================================================================
-def fig_alluvial_taxonomy():
+def create_figure_2d_independent(df_nmf):
+    fig, ax = plt.subplots(figsize=(8, 8))
+    draw_panel_D(ax, df_nmf, is_individual=True)
+    plt.tight_layout()
+    out_pdf = FIGDIR / "Figure_2(d)_raw.pdf"
+    plt.savefig(out_pdf, bbox_inches="tight")
+    plt.close()
+    return out_pdf
+
+
+def create_figure_2c_alluvial_html(df):
     target_orders = ["Poales", "Rosales", "Fagales", "Fabales", "Asterales",
                      "Malpighiales", "Lamiales", "Malvales", "Zingiberales"]
     sub = df[df["Order"].isin(target_orders)]
     agg = sub.groupby(["Order", "Archetype"]).size().reset_index(name="Count")
-
     orders = list(agg["Order"].unique())
     arches = [f"Archetype {i}" for i in sorted(agg["Archetype"].unique())]
     nodes = orders + arches
     nidx = {n: i for i, n in enumerate(nodes)}
 
+    node_colors = [ARCH_HEX[int(n.split(" ")[1]) - 1] if "Archetype" in n
+                   else "lightgrey" for n in nodes]
+    link_colors = [ARCH_RGBA[int(t_arch) - 1] for t_arch in agg["Archetype"]]
+
     fig = go.Figure(data=[go.Sankey(
-        node=dict(pad=15, thickness=20,
-                  line=dict(color="black", width=0.5),
-                  label=nodes, color="lightgrey"),
-        link=dict(
-            source=agg["Order"].map(nidx),
-            target=agg["Archetype"].apply(lambda x: f"Archetype {x}").map(nidx),
-            value=agg["Count"],
-            color="rgba(100,149,237,0.4)"),
+        node=dict(pad=15, thickness=20, line=dict(color="black", width=0.5),
+                  label=nodes, color=node_colors),
+        link=dict(source=agg["Order"].map(nidx),
+                  target=agg["Archetype"].apply(lambda x: f"Archetype {x}").map(nidx),
+                  value=agg["Count"], color=link_colors)
     )])
     fig.update_layout(
-        title_text="Concordance and Divergence Between Biological Phylogeny "
-                   "and Structural Allergenic Archetypes",
+        title_text="Concordance and divergence between biological phylogeny "
+                   "and structural allergenic archetypes",
         font_size=18, width=1400, height=900)
-    out = FIGDIR / f"Figure{FIGNUM['alluvial']}_sankey_taxonomy.html"
-    fig.write_html(str(out))
-    log(f"[OK] Figure {FIGNUM['alluvial']} (alluvial) -> {out}")
+    out_html = FIGDIR / "Figure_2(c)_alluvial.html"
+    fig.write_html(str(out_html))
+    return out_html
 
 
-# ===========================================================================
-# 실행
-# ===========================================================================
+def create_figure_2_combined(df_nmf, top_order, top_family, top_protfam):
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9),
+                             gridspec_kw={"width_ratios": [1, 1.4, 1]})
+
+    draw_panel_A([axes[0, 0], axes[0, 1], axes[0, 2]],
+                 top_order, top_family, top_protfam, is_individual=False)
+    draw_panel_B(axes[1, 0], df_nmf, is_individual=False)
+    draw_panel_C_native(axes[1, 1], df_nmf, is_individual=False)
+    draw_panel_D(axes[1, 2], df_nmf, is_individual=False)
+
+    plt.tight_layout()
+    out_pdf = FIGDIR / "Figure_2_raw.pdf"
+    plt.savefig(out_pdf, bbox_inches="tight", pad_inches=0.25)
+    plt.close()
+    return out_pdf
+
+
+# ---------------------------------------------------------------------------
+# 4. A4 formatting (post-processing)
+# ---------------------------------------------------------------------------
+def apply_a4_formatting(pdf_tasks):
+    MM = 72.0 / 25.4
+    A4_W, A4_H = 210 * MM, 297 * MM
+    margin = 15 * MM
+    legend_space = 45 * MM
+
+    for src_pdf_path, fig_label in pdf_tasks:
+        if not src_pdf_path.exists():
+            continue
+
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=(A4_W, A4_H))
+        c.setFillColor(white)
+        c.rect(0, 0, A4_W, A4_H, fill=1, stroke=0)
+        c.setFillColor(black)
+        c.setFont("Helvetica", 10)
+        c.drawRightString(A4_W - margin, margin, f"{fig_label}_Heo and Rhee")
+        c.showPage()
+        c.save()
+        buf.seek(0)
+
+        src = PdfReader(src_pdf_path)
+        sp = src.pages[0]
+
+        left, bottom = float(sp.mediabox.left), float(sp.mediabox.bottom)
+        sw, sh = float(sp.mediabox.width), float(sp.mediabox.height)
+
+        avail_w = A4_W - 2 * margin
+        avail_h = A4_H - margin - (margin + legend_space)
+        scale = min(avail_w / sw, avail_h / sh)
+
+        fw, fh = sw * scale, sh * scale
+        tx = margin + (avail_w - fw) / 2.0
+        ty = (A4_H - margin) - fh
+
+        op = (Transformation()
+              .translate(-left, -bottom)
+              .scale(scale)
+              .translate(tx, ty))
+
+        base = PdfReader(buf)
+        page = base.pages[0]
+        page.merge_transformed_page(sp, op)
+
+        final_pdf_path = A4DIR / f"{fig_label.replace(' ', '_')}.pdf"
+        writer = PdfWriter()
+        writer.add_page(page)
+        with open(final_pdf_path, "wb") as f:
+            writer.write(f)
+
+        # Keep only the A4-formatted output.
+        os.remove(src_pdf_path)
+        print(f"[A4] {final_pdf_path.name}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # 그림만 생성한다. AMI / 편상관 등 통계 검정은
-    # 05_statistical_analysis.py 에서 수행한다.
-    fig_dataset_overview()
-    fig_dominance_landscape()
-    fig_compositional_fingerprint()
-    fig_alluvial_taxonomy()
+    print("1. Loading data and running NMF...")
+    df_nmf, top_order, top_family, top_protfam = prepare_data()
 
-    df.to_csv(FIGDIR / "figure_source_data.csv", index=False,
-              encoding="utf-8-sig")
-    (RESULTS_DIR / "figure_generation_log.txt").write_text(
-        "\n".join(_log), encoding="utf-8")
-    log(f"\n[DONE] 그림 -> {FIGDIR}")
-    log("[NEXT] 통계 검정은 05_statistical_analysis.py 를 실행할 것")
+    print("2. Building individual panels...")
+    fig2a_pdf = create_figure_2a_independent(top_order, top_family, top_protfam)
+    fig2d_pdf = create_figure_2d_independent(df_nmf)
+    fig2c_html = create_figure_2c_alluvial_html(df_nmf)
+    print(f"[HTML] {fig2c_html.name}")
+
+    print("3. Assembling the combined 2x3 Figure 2...")
+    fig2_pdf = create_figure_2_combined(df_nmf, top_order, top_family, top_protfam)
+
+    print("4. Applying A4 formatting and author caption...")
+    pdf_tasks = [
+        (fig2a_pdf, "Figure 2(a)"),
+        (fig2d_pdf, "Figure 2(d)"),
+        (fig2_pdf,  "Figure 2"),
+    ]
+    apply_a4_formatting(pdf_tasks)
+
+    print("\n[DONE] Figures saved to", FIGDIR)
