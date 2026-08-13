@@ -21,12 +21,9 @@ allergen-nmf-archetypes/
 │   ├── 01_data_preprocessing.py     # SQLite DB  -> allergen_source_matrix.csv
 │   ├── 02_nmf_k_selection.py        # Consensus NMF, K selection (Figure 1)
 │   ├── 03_cluster_analysis.py       # K=6 membership report (Tables 1–2 source data)
-│   ├── 04_figure_generation.py      # Individual panels of Figure 2 (A–D) + Figure 3 inputs
+│   ├── 04_figure_generation.py      # Figure 2 panels (A–D), combined Figure 2, A4 layout
 │   └── 05_statistical_analysis.py   # All reported statistics (counts, bias, rarefaction, AMI)
-├── figures/
-│   └── assembly/          # Helper scripts that stitch individual panels into the final figures
-│       ├── merge_figure1_panels.py
-│       └── merge_figure2_panels.py
+├── figures/               # Auto-generated figure outputs (PDF / PNG / HTML)
 ├── data/                  # Place the SQLite database here (see Data availability)
 │   └── allergen_source_matrix.csv   # Processed 204 × 840 matrix (provided)
 └── results/               # Auto-generated outputs (gitignored)
@@ -87,21 +84,21 @@ python src/02_nmf_k_selection.py
 python src/03_cluster_analysis.py          # defaults to K=6
 python src/03_cluster_analysis.py 6 7      # or pass specific K values
 
-# 4. Individual figure panels  ->  figures/
+# 4. Figure 2 panels + combined Figure 2 (A4-formatted)  ->  figures/
 python src/04_figure_generation.py
 
 # 5. All manuscript statistics  ->  results/statistical_analysis.txt
 python src/05_statistical_analysis.py
 ```
 
-### Figure assembly
+### Figures
 
-`04_figure_generation.py` produces the individual panels (bar plots, compositional
-fingerprint, Sankey/alluvial, dominance landscape). The scripts in
-`figures/assembly/` combine those panels into the composite figures used in the
-paper. They stitch images by pixel coordinates, so if panel sizes change you may
-need to adjust the paths and crop coordinates inside them. These are layout
-helpers, not part of the analytical pipeline.
+`02_nmf_k_selection.py` renders the combined K-selection figure (Figure 1), and
+`04_figure_generation.py` renders each panel of Figure 2 (bar plots, compositional
+fingerprint, alluvial, dominance landscape), assembles the combined Figure 2, and
+applies the A4 layout with the author caption. Both scripts write directly to
+`figures/`; no separate stitching step is required. The alluvial view is also
+exported as a standalone interactive HTML (`Figure_2(c)_alluvial.html`).
 
 ### Figure 3 (phylogenetic tree)
 
