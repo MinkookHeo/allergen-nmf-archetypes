@@ -2,6 +2,9 @@
 """
 Compute every statistic reported in the manuscript.
 
+Loads precomputed NMF results (W, H matrices) from 03_cluster_analysis.py
+rather than refitting.
+
 Sections:
   [1] COUNTS      descriptive statistics (Core/Ambiguous, per-archetype counts)
   [2] BIAS        test whether repertoire entropy is an annotation artifact
@@ -54,7 +57,6 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from scipy.stats import rankdata
-from sklearn.decomposition import NMF
 from sklearn.metrics import adjusted_mutual_info_score
 from sklearn.preprocessing import Normalizer
 
@@ -62,15 +64,16 @@ from sklearn.preprocessing import Normalizer
 # 0. Paths / constants (config.py)
 # ---------------------------------------------------------------------------
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from config import DB_PATH, MATRIX_PATH, RESULTS_DIR
+from config import (
+    DB_PATH, MATRIX_PATH, RESULTS_DIR,
+    NMF_W_PATH, NMF_H_PATH,
+    K, RANDOM_STATE, CORE_RA_THRESHOLD,
+    norm_name,
+)
 
 IN_MATRIX = MATRIX_PATH
 OUT_TXT = RESULTS_DIR / "statistical_analysis.txt"
 OUT_CSV = RESULTS_DIR / "statistics_per_species.csv"
-
-K = 6
-RANDOM_STATE = 42
-CORE_RA_THRESHOLD = 0.80
 
 N_BOOT = 10000          # bootstrap iterations
 N_PERM = 5000           # AMI permutation iterations
@@ -83,10 +86,6 @@ _log = []
 def log(m=""):
     print(m)
     _log.append(str(m))
-
-
-def norm_name(s):
-    return str(s).split(" (")[0].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +120,6 @@ def partial_spearman(x, y, Z=None):
     ry = rankdata(df["y"].to_numpy())
     RZ = np.column_stack([rankdata(df[c].to_numpy()) for c in zcols])
     ex, ey = _residualize(rx, RZ), _residualize(ry, RZ)
-    # If a residual is constant the correlation is undefined
-    # (e.g. identical Per_Family across all species).
     if np.std(ex) < 1e-12 or np.std(ey) < 1e-12:
         return np.nan, np.nan, n, len(zcols)
     rho, p = stats.pearsonr(ex, ey)
@@ -176,7 +173,7 @@ def report(name, rho, p, n, lo, hi, n_ctrl=0, note=""):
     cells, smallest = [], None
     for b in TOST_BOUNDS:
         pt = tost_equivalence(rho, n, n_ctrl, bound=b)
-        cells.append(f"\u00b1{b:.2f}:{pt:.3f}{'*' if pt < 0.05 else ' '}")
+        cells.append(f"±{b:.2f}:{pt:.3f}{'*' if pt < 0.05 else ' '}")
         if pt < 0.05 and smallest is None:
             smallest = b
     log("      TOST p (equivalence) " + "  ".join(cells) + "   (* = holds)")
@@ -226,7 +223,6 @@ def species_annotation_profile(db_path):
                         + rel["Short_name"].fillna("Unknown"))
     rel["Bitscore"] = pd.to_numeric(rel["Bitscore"], errors="coerce").fillna(0)
 
-    # One allergen -> family of its highest-bitscore homolog.
     best = (rel.sort_values("Bitscore", ascending=False)
                .drop_duplicates("Allergen_UID")[["Allergen_UID", "key", "Composite"]])
 
@@ -243,7 +239,7 @@ def species_annotation_profile(db_path):
 # 3. Main
 # ---------------------------------------------------------------------------
 def main():
-    # --- data + NMF
+    # --- data
     raw = pd.read_csv(IN_MATRIX, index_col=0)
     log(f"[OK] Input matrix: {raw.shape[0]} species x {raw.shape[1]} features")
 
@@ -253,11 +249,20 @@ def main():
             f"domain: {zero_rows}")
 
     matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
-    model = NMF(n_components=K, init="nndsvda", max_iter=5000,
-                random_state=RANDOM_STATE)
-    W = model.fit_transform(matrix_norm)
-    H = model.components_
-    log(f"[OK] NMF K={K}: W{W.shape}, H{H.shape}")
+
+    # --- load precomputed NMF; fall back to fitting if .npy absent
+    if NMF_W_PATH.exists() and NMF_H_PATH.exists():
+        W = np.load(NMF_W_PATH)
+        H = np.load(NMF_H_PATH)
+        log(f"[OK] Loaded W{W.shape}, H{H.shape} from {NMF_W_PATH.parent}")
+    else:
+        from sklearn.decomposition import NMF
+        model = NMF(n_components=K, init="nndsvda", max_iter=5000,
+                    random_state=RANDOM_STATE)
+        W = model.fit_transform(matrix_norm)
+        H = model.components_
+        log(f"[WARN] .npy not found; fitted NMF from scratch. "
+            f"Run 03_cluster_analysis.py first for reproducibility.")
 
     o_idx = np.argsort(W, axis=1)[:, ::-1]
     t1 = np.take_along_axis(W, o_idx[:, :1], axis=1).ravel()
@@ -400,13 +405,29 @@ def main():
     log(f"  target depth = {target:,} (10th percentile of positive depths), "
         f"{int(keep.sum())} / {len(depth)} species")
 
+    # For rarefaction transform, need to project through the fitted NMF.
+    # If W was loaded, reconstruct the model via H for transform().
+    # Use a lightweight wrapper that applies the precomputed H.
+    class _NMFProjector:
+        """Project new data through a precomputed H matrix."""
+        def __init__(self, H_matrix):
+            self.components_ = H_matrix
+        def transform(self, X):
+            from sklearn.decomposition import non_negative_factorization
+            W_out, _, _ = non_negative_factorization(
+                X, H=self.components_, n_components=self.components_.shape[0],
+                init="custom", update_H=False, max_iter=500, random_state=RANDOM_STATE)
+            return W_out
+
+    projector = _NMFProjector(H)
+
     rng = np.random.default_rng(RANDOM_STATE)
     sub_idx = np.where(keep)[0]
     probs = counts[sub_idx] / counts[sub_idx].sum(axis=1, keepdims=True)
     acc = np.zeros(len(sub_idx))
     for _ in range(RAREFY_REPS):
         sampled = np.array([rng.multinomial(target, p) for p in probs], float)
-        Wr = model.transform(
+        Wr = projector.transform(
             Normalizer(norm="l1").fit_transform(np.log1p(sampled)))
         Wrn = Wr / Wr.sum(axis=1, keepdims=True).clip(min=1e-12)
         with np.errstate(divide="ignore", invalid="ignore"):
