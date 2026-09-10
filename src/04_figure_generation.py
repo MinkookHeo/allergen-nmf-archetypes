@@ -2,10 +2,8 @@
 """
 Generate the panels of Figure 2 and assemble them.
 
-Builds each panel (A-D) as a reusable module, then renders the individual
-items (Figure 2a, 2c, 2d) and the combined Figure 2, and applies A4
-formatting with an author caption. Statistical tests are not computed here;
-see 05_statistical_analysis.py.
+Loads precomputed NMF results (W matrix) from 03_cluster_analysis.py
+rather than refitting.
 
 Panels:
     A  Top-10 taxonomic orders / families / conserved protein families
@@ -23,14 +21,12 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
 from matplotlib.patches import PathPatch, Rectangle, Patch
 from matplotlib.path import Path as MplPath
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import plotly.graph_objects as go
-from sklearn.decomposition import NMF
 from sklearn.preprocessing import Normalizer
 
 from pypdf import PdfReader, PdfWriter, Transformation
@@ -38,68 +34,41 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.colors import white, black
 
 # ---------------------------------------------------------------------------
-# 0. Paths / constants and colors (config.py)
+# 0. Paths / constants (config.py)
 # ---------------------------------------------------------------------------
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from config import DB_PATH, MATRIX_PATH, FIG_DIR
+from config import (
+    DB_PATH, MATRIX_PATH, RESULTS_DIR, A4DIR,
+    NMF_W_PATH, NMF_MEMBERSHIP_PATH,
+    K, RANDOM_STATE, CORE_RA_THRESHOLD,
+    ARCH_HEX, ARCH_RGBA, CORE_COLOR, AMB_COLOR,
+    cap_first, norm_name, set_journal_font,
+)
 
 IN_MATRIX = MATRIX_PATH
-FIGDIR = FIG_DIR
-A4DIR = FIGDIR / "A4_formatted"
-
-K = 6
-RANDOM_STATE = 42
-
-# CVD-safe (Okabe-Ito) palette
-ARCH_HEX = ['#0072B2', '#D55E00', '#56B4E9', '#E69F00', '#009E73', '#F0E442']
-ARCH_RGBA = ['rgba(0,114,178,0.5)', 'rgba(213,94,0,0.5)', 'rgba(86,180,233,0.5)',
-             'rgba(230,159,0,0.5)', 'rgba(0,158,115,0.5)', 'rgba(240,228,66,0.5)']
-CORE_COLOR = '#D55E00'
-AMB_COLOR = '#0072B2'
-
-FIGDIR.mkdir(parents=True, exist_ok=True)
-A4DIR.mkdir(parents=True, exist_ok=True)
-
-
-def cap_first(s):
-    s = str(s)
-    return s[:1].upper() + s[1:] if s else s
-
-
-def norm_name(s):
-    return str(s).split(" (")[0].strip()
-
-
-# ---------------------------------------------------------------------------
-# Font (Arial / Helvetica)
-# ---------------------------------------------------------------------------
-def set_journal_font():
-    preferred = ["Arial", "Helvetica", "Liberation Sans"]
-    available = {f.name for f in fm.fontManager.ttflist}
-    for name in preferred:
-        if name in available:
-            plt.rcParams["font.family"] = name
-            return
-    plt.rcParams["font.family"] = "sans-serif"
-
+FIGDIR = RESULTS_DIR
 
 set_journal_font()
-plt.rcParams["axes.unicode_minus"] = False
-plt.rcParams["font.weight"] = "normal"
-plt.rcParams["pdf.fonttype"] = 42
-plt.rcParams["ps.fonttype"] = 42
 
 
 # ---------------------------------------------------------------------------
-# 1. Data pipeline (single source of truth)
+# 1. Data pipeline (loads precomputed NMF from 03)
 # ---------------------------------------------------------------------------
 def prepare_data():
     raw = pd.read_csv(IN_MATRIX, index_col=0)
-    matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
 
-    model = NMF(n_components=K, init="nndsvda", max_iter=5000,
-                random_state=RANDOM_STATE)
-    W = model.fit_transform(matrix_norm)
+    # Load precomputed W matrix; fall back to fitting if .npy is absent.
+    if NMF_W_PATH.exists():
+        W = np.load(NMF_W_PATH)
+        print(f"[OK] Loaded W from {NMF_W_PATH}")
+    else:
+        from sklearn.decomposition import NMF
+        matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
+        model = NMF(n_components=K, init="nndsvda", max_iter=5000,
+                    random_state=RANDOM_STATE)
+        W = model.fit_transform(matrix_norm)
+        print("[WARN] W.npy not found; fitted NMF from scratch. "
+              "Run 03_cluster_analysis.py first for reproducibility.")
 
     order_idx = np.argsort(W, axis=1)[:, ::-1]
     top1_idx, top2_idx = order_idx[:, 0], order_idx[:, 1]
@@ -111,7 +80,7 @@ def prepare_data():
     row_sum = W.sum(axis=1)
     relative_abundance = top1_w / np.where(row_sum == 0, 1, row_sum)
 
-    is_core = relative_abundance >= 0.80
+    is_core = relative_abundance >= CORE_RA_THRESHOLD
     status = np.where(is_core, "Core Member", "Ambiguous")
 
     df_nmf = pd.DataFrame({
@@ -218,7 +187,7 @@ def draw_panel_B(ax, df_nmf, is_individual=False):
             continue
         r = m.iloc[0]; w = r[wc].to_numpy(dtype=float)
         frac = w / w.sum()
-        dr = r["Dominance_Ratio"]; dr_str = "> 10\u00b3" if dr > 1000 else f"{dr:.1f}"
+        dr = r["Dominance_Ratio"]; dr_str = "> 10³" if dr > 1000 else f"{dr:.1f}"
         rows_b.append((label, frac, dr_str, float(frac.max())))
 
     rows_b.sort(key=lambda x: x[3])
@@ -329,7 +298,7 @@ def draw_panel_D(ax, df_nmf, is_individual=False):
                     alpha=0.75, edgecolor="k", s=60, ax=ax)
     ax.axvline(0.80, color="gray", ls="--", lw=1.5, zorder=0)
     ax.set_yscale("log")
-    ax.set_xlabel("Relative abundance of primary archetype\n(Core if \u2265 0.8)")
+    ax.set_xlabel("Relative abundance of primary archetype\n(Core if ≥ 0.8)")
     ax.set_ylabel("Dominance ratio (log scale)")
     ax.get_legend().remove()
     ax.text(0.90, ax.get_ylim()[1] * 0.4, "Core\n(single-family dominant)",
@@ -477,7 +446,7 @@ def apply_a4_formatting(pdf_tasks):
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("1. Loading data and running NMF...")
+    print("1. Loading data and NMF results...")
     df_nmf, top_order, top_family, top_protfam = prepare_data()
 
     print("2. Building individual panels...")
@@ -497,4 +466,4 @@ if __name__ == "__main__":
     ]
     apply_a4_formatting(pdf_tasks)
 
-    print("\n[DONE] Figures saved to", FIGDIR)
+    print(f"\n[DONE] Figures saved to {FIGDIR}")
