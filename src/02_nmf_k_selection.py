@@ -7,9 +7,14 @@ residual sum of squares (RSS) and the delta area under the consensus CDF,
 and renders the K-selection panels together with representative consensus
 heatmaps.
 
-Output (Figure 1): figures/Figure_1.png and figures/Figure_1.pdf
+Output (Figure 1): results/Figure_1.png and results/Figure_1.pdf
+
+Usage:
+    python 02_nmf_k_selection.py                    # default heatmaps K=3-8
+    python 02_nmf_k_selection.py --heatmap 4 5 6 7  # custom heatmap K values
 """
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -24,19 +29,17 @@ from sklearn.decomposition import NMF
 from sklearn.preprocessing import Normalizer
 
 # ---------------------------------------------------------------------------
-# 0. Configuration (config.py; journal font settings)
+# 0. Configuration (config.py)
 # ---------------------------------------------------------------------------
-plt.rcParams["font.family"] = "Arial"
-plt.rcParams["font.size"] = 11
-
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from config import MATRIX_PATH, RESULTS_DIR, FIG_DIR
+from config import MATRIX_PATH, RESULTS_DIR, CACHE_DIR, set_journal_font
 
-CACHE_DIR = RESULTS_DIR / "consensus_cache"
+set_journal_font()
+
 IN_MATRIX = MATRIX_PATH
 OUT_METRICS = RESULTS_DIR / "NMF_K_selection_metrics.csv"
-OUT_FIG_PNG = FIG_DIR / "Figure_1.png"
-OUT_FIG_PDF = FIG_DIR / "Figure_1.pdf"
+OUT_FIG_PNG = RESULTS_DIR / "Figure_1.png"
+OUT_FIG_PDF = RESULTS_DIR / "Figure_1.pdf"
 
 K_RANGE = range(2, 16)
 N_RUNS = 30
@@ -48,8 +51,6 @@ NMF_KWARGS = dict(
     tol=1e-4,
     max_iter=2000,
 )
-
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +117,13 @@ def cophenetic_corr(consensus):
 # 3. Run
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Consensus NMF K-selection (Figure 1).")
+    parser.add_argument("--heatmap", type=int, nargs="*", default=[3, 4, 5, 6, 7, 8],
+                        help="K values for consensus heatmaps (default: 3 4 5 6 7 8)")
+    args = parser.parse_args()
+    target_ks = args.heatmap
+
     t0 = time.time()
 
     matrix_norm, feature_names, species_names = load_processed_data(IN_MATRIX)
@@ -181,15 +189,7 @@ if __name__ == "__main__":
     sns.despine(ax=axes[0, 1])
     sns.despine(ax=axes[0, 2])
 
-    # (D) Consensus heatmaps (rows 2-3). Non-interactive default: K = 3..8.
-    try:
-        k_input = input(
-            "\nK values for heatmaps (space-separated; Enter for default 3-8): "
-        ).strip()
-    except (EOFError, OSError):
-        k_input = ""
-    target_ks = [int(v) for v in k_input.split()] if k_input else [3, 4, 5, 6, 7, 8]
-
+    # (D) Consensus heatmaps (rows 2-3)
     heatmap_axes = axes[1:, :].flatten()
 
     for i, k in enumerate(target_ks):
