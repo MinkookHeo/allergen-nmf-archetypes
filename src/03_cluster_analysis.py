@@ -9,6 +9,9 @@ weights, and Core/Ambiguous classification).
 Classification follows the single manuscript criterion: a species is a Core
 Member when the relative abundance of its primary archetype is >= 0.80.
 
+The fitted W and H matrices are saved as .npy files so that downstream
+scripts (04, 05) can load them without refitting.
+
 Usage:
     python 03_cluster_analysis.py            # default K = 6
     python 03_cluster_analysis.py 6 7        # or pass specific K values
@@ -27,13 +30,14 @@ from sklearn.preprocessing import Normalizer
 # 0. Paths / constants (config.py)
 # ---------------------------------------------------------------------------
 sys.path.append(str(Path(__file__).resolve().parent.parent))
-from config import DB_PATH, MATRIX_PATH, RESULTS_DIR
+from config import (
+    DB_PATH, MATRIX_PATH, RESULTS_DIR,
+    NMF_W_PATH, NMF_H_PATH, NMF_MEMBERSHIP_PATH,
+    K, RANDOM_STATE, MAX_ITER, CORE_RA_THRESHOLD,
+    norm_name,
+)
 
 IN_MATRIX = MATRIX_PATH
-
-RANDOM_STATE = 42
-MAX_ITER = 5000
-CORE_RA_THRESHOLD = 0.80        # single classification criterion
 
 _log = []
 
@@ -41,11 +45,6 @@ _log = []
 def log(m=""):
     print(m)
     _log.append(str(m))
-
-
-def norm_name(s):
-    """'Genus species (common name)' -> 'Genus species'."""
-    return str(s).split(" (")[0].strip()
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +71,7 @@ def load_final_matrix(file_path):
 
 
 # ---------------------------------------------------------------------------
-# 2. Taxonomy mapping (SQLite; identical logic to 04)
+# 2. Taxonomy mapping (SQLite)
 # ---------------------------------------------------------------------------
 def get_taxonomy_info(db_path, species_list):
     import sqlite3
@@ -91,7 +90,6 @@ def get_taxonomy_info(db_path, species_list):
         return base.drop(columns=["key"])
 
     tax["key"] = tax["Species"].apply(norm_name)
-    # Drop invalid values before mapping (consistent with 04).
     valid = ~tax["Ord"].isin(["Not Found", "Unknown", None])
     map_order = tax[valid].drop_duplicates("key").set_index("key")["Ord"]
     map_family = tax[valid].drop_duplicates("key").set_index("key")["Family"]
@@ -120,6 +118,13 @@ def generate_report(matrix, feature_names, species_names, db_path, k_val):
     W = model.fit_transform(matrix)      # species x archetype
     H = model.components_                # archetype x feature
     log(f"[OK] NMF K={k_val}: W{W.shape}, H{H.shape}")
+
+    # --- persist W, H for downstream scripts (04, 05) ---------------------
+    if k_val == K:
+        np.save(NMF_W_PATH, W)
+        np.save(NMF_H_PATH, H)
+        log(f"[OK] Saved W -> {NMF_W_PATH}")
+        log(f"[OK] Saved H -> {NMF_H_PATH}")
 
     # --- primary / secondary archetype -------------------------------------
     sorted_idx = np.argsort(W, axis=1)[:, ::-1]
@@ -192,6 +197,11 @@ def generate_report(matrix, feature_names, species_names, db_path, k_val):
               .sort_values(by=["Archetype", "_order", "Dominance_Ratio"],
                            ascending=[True, True, False])
               .drop(columns=["_order"]))
+
+    # --- persist membership CSV for downstream scripts (04, 05) -----------
+    if k_val == K:
+        df_tax.to_csv(NMF_MEMBERSHIP_PATH, index=False, encoding="utf-8-sig")
+        log(f"[OK] Membership CSV -> {NMF_MEMBERSHIP_PATH}")
 
     out_xlsx = RESULTS_DIR / f"NMF_Final_Analysis_K{k_val}_Step3_Advanced.xlsx"
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
