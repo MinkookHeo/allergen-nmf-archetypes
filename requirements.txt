@@ -8,8 +8,9 @@ openpyxl>=3.1
 # Figures (04)
 matplotlib>=3.6
 seaborn>=0.12
-plotly>=5.11        # interactive Sankey exported as standalone HTML (Figure 2c)
+plotly>=5.11        # interactive Sankey exported as standalone HTML (Figure 2d)
 pypdf>=4.0          # A4 layout / page transforms for the figure PDFs
 reportlab>=4.0      # A4 canvas and author caption
+pymupdf>=1.24       # crop and A4 composition of the Figure 3 tree PDF
 
-# Standard library used: io, os, sys, time, sqlite3, argparse, pathlib
+# Standard library used: io, os, re, sys, time, difflib, shutil, sqlite3, pathlib
