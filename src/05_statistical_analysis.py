@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Compute every statistic reported in the manuscript.
+05_Statistical_Analysis.py
 
-Loads precomputed NMF results (W, H matrices) from 03_cluster_analysis.py
-rather than refitting.
+Compute every statistic reported in the manuscript.
 
 Sections:
   [1] COUNTS      descriptive statistics (Core/Ambiguous, per-archetype counts)
@@ -11,46 +10,11 @@ Sections:
   [3] RAREFACTION entropy rank stability after equalizing sequencing depth
   [4] AMI         archetype vs taxonomy agreement with a permutation null
 
-Rationale for [2]
------------------------------------------------------------------------------
-The question is whether the multi-family profile of an Ambiguous species is
-genuine biology or a by-product of the species being well studied and having
-many registered allergens.
-
-The difficulty is that every candidate proxy carries both components at once:
-feature richness, homolog count, total bitscore, and reference-allergen count
-all reflect annotation depth AND true breadth simultaneously. Peanut carrying
-Ara h 1-17 is partly a matter of fame, but also because it genuinely spans
-cupin / prolamin / PR-10 / profilin. A partial correlation controlling a
-single proxy therefore cannot separate the two components.
-
-This script instead decomposes the reference-allergen count into two parts:
-
-      n_allergens = n_families  x  allergens_per_family
-                    -----------    -------------------
-                    breadth        redundant listing
-                    (biology)      (annotation depth)
-
-Two species may each have 10 allergens, yet one has all 10 as 2S albumin
-(n_families=1, per_family=10) while the other spreads them across 6 families
-(n_families=6, per_family=1.7). The former is deep only; the latter is
-genuinely multi-family.
-
-  Test A : entropy vs n_families                     -> breadth component
-  Test B : entropy vs per_family | n_families held   -> pure depth component
-  Test C : entropy vs n_allergens | n_families held  -> alternative form of B
-
-If B and C are null, "listing depth alone does not create entropy" can be
-stated quantitatively. If B is significant, it must be moved to Limitations.
-
-Reporting principles
-  - Do not accept the null from a p-value alone; report a bootstrap 95% CI.
-  - Use TOST equivalence testing to affirm negligible magnitude.
-  - Report every correlation that reaches significance, without hiding any.
+The factorization saved by 03 is reused; the model is refitted only for the
+rarefaction step, which requires model.transform().
 """
 
 import sqlite3
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -60,32 +24,31 @@ from scipy.stats import rankdata
 from sklearn.metrics import adjusted_mutual_info_score
 from sklearn.preprocessing import Normalizer
 
-# ---------------------------------------------------------------------------
-# 0. Paths / constants (config.py)
-# ---------------------------------------------------------------------------
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# --- allow "from config import ..." when run from src/ -------------
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.append(str(_Path(__file__).resolve().parent.parent))
+# -------------------------------------------------------------------
 from config import (
     DB_PATH, MATRIX_PATH, RESULTS_DIR,
     NMF_W_PATH, NMF_H_PATH,
     K, RANDOM_STATE, CORE_RA_THRESHOLD,
-    norm_name,
+    TAXONOMY_CORRECTIONS, MANUAL_ORDERS,
+    norm_name, Logger,
 )
 
-IN_MATRIX = MATRIX_PATH
+# ---------------------------------------------------------------------------
+# 0. Setup
+# ---------------------------------------------------------------------------
 OUT_TXT = RESULTS_DIR / "statistical_analysis.txt"
 OUT_CSV = RESULTS_DIR / "statistics_per_species.csv"
 
-N_BOOT = 10000          # bootstrap iterations
-N_PERM = 5000           # AMI permutation iterations
-RAREFY_REPS = 200       # rarefaction iterations
+N_BOOT = 10000
+N_PERM = 5000
+RAREFY_REPS = 200
 TOST_BOUNDS = (0.15, 0.20, 0.25, 0.30)
 
-_log = []
-
-
-def log(m=""):
-    print(m)
-    _log.append(str(m))
+log = Logger()
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +61,6 @@ def _residualize(rank_y, rank_Z):
 
 
 def partial_spearman(x, y, Z=None):
-    """Partial Spearman correlation; simple Spearman when Z is None."""
     df = pd.DataFrame({"x": np.asarray(x, float), "y": np.asarray(y, float)})
     if Z is not None:
         Z = np.atleast_2d(np.asarray(Z, float))
@@ -149,7 +111,6 @@ def boot_ci(x, y, Z=None, n_boot=N_BOOT, seed=0, alpha=0.05):
 
 
 def tost_equivalence(rho, n, n_ctrl=0, bound=0.25):
-    """Fisher z-based TOST. H0: |rho| >= bound."""
     dof = n - 3 - n_ctrl
     if dof <= 0 or not np.isfinite(rho):
         return np.nan
@@ -192,16 +153,7 @@ def report(name, rho, p, n, lo, hi, n_ctrl=0, note=""):
 # ---------------------------------------------------------------------------
 # 2. Per-species annotation profile (DB)
 # ---------------------------------------------------------------------------
-def species_annotation_profile(db_path):
-    """
-    Aggregate per species:
-        N_Allergens : number of WHO/IUIS reference allergens  (depth x breadth)
-        N_Families  : distinct families spanned by those allergens  (breadth)
-        Per_Family  : N_Allergens / N_Families  (redundant listing = depth)
-        N_Homologs  : number of unique recovered homologs
-    Each allergen's family is defined by the CDD composite identifier
-    (Superfamily|Short name) of its highest-bitscore homolog.
-    """
+def species_annotation_profile():
     q = """
     SELECT A.rowid           AS Allergen_UID,
            A.species         AS Source_Species,
@@ -215,7 +167,7 @@ def species_annotation_profile(db_path):
     LEFT JOIN Protein_families P
       ON C.Similar_Protein = P.Query
     """
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(DB_PATH) as conn:
         rel = pd.read_sql_query(q, conn)
 
     rel["key"] = rel["Source_Species"].apply(norm_name)
@@ -239,8 +191,7 @@ def species_annotation_profile(db_path):
 # 3. Main
 # ---------------------------------------------------------------------------
 def main():
-    # --- data
-    raw = pd.read_csv(IN_MATRIX, index_col=0)
+    raw = pd.read_csv(MATRIX_PATH, index_col=0)
     log(f"[OK] Input matrix: {raw.shape[0]} species x {raw.shape[1]} features")
 
     zero_rows = raw.index[raw.sum(axis=1) == 0].tolist()
@@ -248,21 +199,19 @@ def main():
         log(f"[WARN] {len(zero_rows)} species have no assignable conserved "
             f"domain: {zero_rows}")
 
-    matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
-
-    # --- load precomputed NMF; fall back to fitting if .npy absent
+    # Reuse the factorization saved by 03
     if NMF_W_PATH.exists() and NMF_H_PATH.exists():
         W = np.load(NMF_W_PATH)
         H = np.load(NMF_H_PATH)
-        log(f"[OK] Loaded W{W.shape}, H{H.shape} from {NMF_W_PATH.parent}")
+        log(f"[OK] Factorization loaded: W{W.shape}, H{H.shape}")
     else:
         from sklearn.decomposition import NMF
-        model = NMF(n_components=K, init="nndsvda", max_iter=5000,
-                    random_state=RANDOM_STATE)
+        log("[WARN] W/H .npy not found -> refitting NMF (run 03 first)")
+        matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
+        model = NMF(n_components=K, init="nndsvda",
+                    max_iter=5000, random_state=RANDOM_STATE)
         W = model.fit_transform(matrix_norm)
         H = model.components_
-        log(f"[WARN] .npy not found; fitted NMF from scratch. "
-            f"Run 03_cluster_analysis.py first for reproducibility.")
 
     o_idx = np.argsort(W, axis=1)[:, ::-1]
     t1 = np.take_along_axis(W, o_idx[:, :1], axis=1).ravel()
@@ -308,7 +257,7 @@ def main():
         "Total_Bitscore": raw.sum(axis=1).to_numpy(),
     })
     df["key"] = df["Display_Name"].apply(norm_name)
-    df = df.join(species_annotation_profile(DB_PATH), on="key")
+    df = df.join(species_annotation_profile(), on="key")
     n_miss = int(df["N_Allergens"].isna().sum())
     log(f"\n  Per-species DB profile mapped (unmatched: {n_miss} species)")
     for nm in df.loc[df["N_Allergens"].isna(), "Display_Name"]:
@@ -325,8 +274,6 @@ def main():
 
         log("\n-- (a) Simple correlations: all reported "
             "(interpretation via the decomposition below) --")
-        log("     Note: each variable below carries both annotation depth and")
-        log("           true breadth, so none can be interpreted alone.")
         for col, label in [
                 ("N_Allergens", "entropy vs number of reference allergens"),
                 ("N_Families", "entropy vs number of allergen families"),
@@ -339,9 +286,6 @@ def main():
             report(label, r, p, n, lo, hi)
 
         log("\n-- (b) Decomposition: breadth component vs depth component --")
-        log("     n_allergens = n_families x per_family")
-        log("                   (breadth)    (redundant listing = depth)")
-
         nf = sub[["N_Families"]].to_numpy(float)
 
         r, p, n, _ = partial_spearman(e, sub["N_Families"].to_numpy(float))
@@ -394,9 +338,6 @@ def main():
     log("\n" + "=" * 68)
     log("[3] RAREFACTION  entropy rank stability after depth equalization")
     log("=" * 68)
-    log("  Goal: test whether entropy ranks arise from per-species total counts.")
-    log("        High agreement with the original entropy means depth does not")
-    log("        drive the ranks.")
 
     counts = raw.to_numpy(float)
     depth = counts.sum(axis=1)
@@ -405,21 +346,12 @@ def main():
     log(f"  target depth = {target:,} (10th percentile of positive depths), "
         f"{int(keep.sum())} / {len(depth)} species")
 
-    # For rarefaction transform, need to project through the fitted NMF.
-    # If W was loaded, reconstruct the model via H for transform().
-    # Use a lightweight wrapper that applies the precomputed H.
-    class _NMFProjector:
-        """Project new data through a precomputed H matrix."""
-        def __init__(self, H_matrix):
-            self.components_ = H_matrix
-        def transform(self, X):
-            from sklearn.decomposition import non_negative_factorization
-            W_out, _, _ = non_negative_factorization(
-                X, H=self.components_, n_components=self.components_.shape[0],
-                init="custom", update_H=False, max_iter=500, random_state=RANDOM_STATE)
-            return W_out
-
-    projector = _NMFProjector(H)
+    # Rarefaction needs model.transform(), so the model is refitted here
+    from sklearn.decomposition import NMF as _NMF
+    matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
+    model = _NMF(n_components=K, init="nndsvda",
+                 max_iter=5000, random_state=RANDOM_STATE)
+    model.fit(matrix_norm)
 
     rng = np.random.default_rng(RANDOM_STATE)
     sub_idx = np.where(keep)[0]
@@ -427,7 +359,7 @@ def main():
     acc = np.zeros(len(sub_idx))
     for _ in range(RAREFY_REPS):
         sampled = np.array([rng.multinomial(target, p) for p in probs], float)
-        Wr = projector.transform(
+        Wr = model.transform(
             Normalizer(norm="l1").fit_transform(np.log1p(sampled)))
         Wrn = Wr / Wr.sum(axis=1, keepdims=True).clip(min=1e-12)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -465,8 +397,24 @@ def main():
             "SELECT Species, [Order] AS Ord FROM SpeciesTaxonomy", conn)
     tax["key"] = tax["Species"].apply(norm_name)
     valid = ~tax["Ord"].isin(["Not Found", "Unknown", None])
-    df["Order"] = df["key"].map(
+
+    # Separate key for the taxonomy lookup; "key" still joins the DB profile
+    df["tax_key"] = df["key"].replace(TAXONOMY_CORRECTIONS)
+    df["Order"] = df["tax_key"].map(
         tax[valid].drop_duplicates("key").set_index("key")["Ord"])
+
+    # Species the database cannot resolve fall back to the manual table
+    n_before = int(df["Order"].isna().sum())
+    df["Order"] = df["Order"].fillna(df["tax_key"].map(MANUAL_ORDERS))
+    n_manual = n_before - int(df["Order"].isna().sum())
+    if n_manual:
+        log(f"  Orders supplied from MANUAL_ORDERS: {n_manual}")
+    n_miss = int(df["Order"].isna().sum())
+    if n_miss:
+        log(f"  [WARN] {n_miss} species without an Order are excluded from AMI")
+        for nm in df.loc[df["Order"].isna(), "Display_Name"]:
+            log(f"         - {nm}")
+
     df["Archetype"] = o_idx[:, 0] + 1
 
     sub = df[df["Order"].notna()]
@@ -493,8 +441,9 @@ def main():
             "phylogeny.")
 
     # --- save
-    df.drop(columns=["key"]).to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
-    OUT_TXT.write_text("\n".join(_log), encoding="utf-8")
+    df.drop(columns=[c for c in ["key", "tax_key"] if c in df.columns]) \
+      .to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+    log.save(OUT_TXT)
     log(f"\n[DONE] per-species values -> {OUT_CSV}")
     log(f"[DONE] log -> {OUT_TXT}")
 
