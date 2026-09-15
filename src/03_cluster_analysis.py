@@ -1,91 +1,81 @@
 # -*- coding: utf-8 -*-
 """
-Fit NMF at a chosen K and export per-species archetype membership.
+03_cluster_analysis.py
 
-Produces an Excel report with two sheets: archetype signatures (top features
-of each H component) and species membership (primary/secondary archetype,
-weights, and Core/Ambiguous classification).
+Applies NMF at rank K to allergen_source_matrix.csv and writes the per-species
+archetype membership table as an Excel report.
 
-Classification follows the single manuscript criterion: a species is a Core
-Member when the relative abundance of its primary archetype is >= 0.80.
+Core membership follows a single criterion, a relative archetype weight of at
+least 0.80 for the primary archetype; all other species are labelled Ambiguous.
 
-The fitted W and H matrices are saved as .npy files so that downstream
-scripts (04, 05) can load them without refitting.
-
-Usage:
-    python 03_cluster_analysis.py            # default K = 6
-    python 03_cluster_analysis.py 6 7        # or pass specific K values
+The factorization (W, H) is saved as .npy so that 04, 05, 07 and 08 can reuse it
+without refitting the model.
 """
 
-import argparse
+import sqlite3
 import sys
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import NMF
 from sklearn.preprocessing import Normalizer
 
-# ---------------------------------------------------------------------------
-# 0. Paths / constants (config.py)
-# ---------------------------------------------------------------------------
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# --- allow "from config import ..." when run from src/ -------------
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.append(str(_Path(__file__).resolve().parent.parent))
+# -------------------------------------------------------------------
 from config import (
     DB_PATH, MATRIX_PATH, RESULTS_DIR,
     NMF_W_PATH, NMF_H_PATH, NMF_MEMBERSHIP_PATH,
     K, RANDOM_STATE, MAX_ITER, CORE_RA_THRESHOLD,
-    norm_name,
+    TAXONOMY_CORRECTIONS, MANUAL_ORDERS,
+    norm_name, Logger,
 )
 
-IN_MATRIX = MATRIX_PATH
-
-_log = []
-
-
-def log(m=""):
-    print(m)
-    _log.append(str(m))
+# ===========================================================================
+# 0. Setup
+# ===========================================================================
+log = Logger()
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # 1. Load and preprocess
-# ---------------------------------------------------------------------------
+# ===========================================================================
 def load_final_matrix(file_path):
-    """log1p transform followed by per-species (row) L1 normalization."""
-    path = Path(file_path)
-    if not path.exists():
-        log(f"[ERROR] File not found: {path}")
+    """log1p transform followed by row-wise (per-species) L1 normalization."""
+    if not file_path.exists():
+        log(f"[ERROR] File not found: {file_path}")
         sys.exit(1)
 
-    df = pd.read_csv(path, index_col=0)
+    df = pd.read_csv(file_path, index_col=0)
 
     zero_rows = df.index[df.sum(axis=1) == 0].tolist()
     if zero_rows:
         log(f"[WARN] {len(zero_rows)} species have no assignable conserved "
             f"domain: {zero_rows}")
-        log("       Their W rows are zero and they fall into Ambiguous.")
+        log("       Their W rows are zero, so they fall into Ambiguous.")
 
     matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(df))
-    log(f"[OK] Ready: {df.shape[0]} species x {df.shape[1]} families")
+    log(f"[OK] Ready: {df.shape[0]} species x {df.shape[1]} protein families")
     return matrix_norm, df.columns, df.index
 
 
-# ---------------------------------------------------------------------------
-# 2. Taxonomy mapping (SQLite)
-# ---------------------------------------------------------------------------
-def get_taxonomy_info(db_path, species_list):
-    import sqlite3
-
+# ===========================================================================
+# 2. Taxonomy mapping from SQLite
+# ===========================================================================
+def get_taxonomy_info(species_list):
     base = pd.DataFrame({"Display_Name": list(species_list)})
     base["key"] = base["Display_Name"].apply(norm_name)
+    base["key"] = base["key"].replace(TAXONOMY_CORRECTIONS)
 
     try:
-        with sqlite3.connect(db_path) as conn:
+        with sqlite3.connect(DB_PATH) as conn:
             tax = pd.read_sql_query(
                 "SELECT Species, [Order] AS Ord, Family FROM SpeciesTaxonomy", conn)
     except Exception as e:
         log(f"[WARN] DB mapping error: {e}")
-        base["Order"] = np.nan
+        base["Order"] = base["key"].map(MANUAL_ORDERS)
         base["Family"] = np.nan
         return base.drop(columns=["key"])
 
@@ -97,6 +87,13 @@ def get_taxonomy_info(db_path, species_list):
     base["Order"] = base["key"].map(map_order)
     base["Family"] = base["key"].map(map_family)
 
+    # Species the database cannot resolve fall back to the manual table
+    n_before = int(base["Order"].isna().sum())
+    base["Order"] = base["Order"].fillna(base["key"].map(MANUAL_ORDERS))
+    n_manual = n_before - int(base["Order"].isna().sum())
+    if n_manual:
+        log(f"[OK] Orders supplied from MANUAL_ORDERS: {n_manual}")
+
     n_miss = int(base["Order"].isna().sum())
     log(f"[OK] Taxonomy mapping: {n_miss} species without an Order match")
     for nm in base.loc[base["Order"].isna(), "Display_Name"]:
@@ -104,13 +101,12 @@ def get_taxonomy_info(db_path, species_list):
 
     return base.drop(columns=["key"])
 
-
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # 3. Analysis and report
-# ---------------------------------------------------------------------------
-def generate_report(matrix, feature_names, species_names, db_path, k_val):
+# ===========================================================================
+def generate_report(matrix, feature_names, species_names, k_val):
     log(f"\n{'=' * 62}")
-    log(f"[RUN] K={k_val} detailed analysis")
+    log(f"[RUN] K={k_val}")
     log("=" * 62)
 
     model = NMF(n_components=k_val, init="nndsvda",
@@ -119,43 +115,41 @@ def generate_report(matrix, feature_names, species_names, db_path, k_val):
     H = model.components_                # archetype x feature
     log(f"[OK] NMF K={k_val}: W{W.shape}, H{H.shape}")
 
-    # --- persist W, H for downstream scripts (04, 05) ---------------------
-    if k_val == K:
-        np.save(NMF_W_PATH, W)
-        np.save(NMF_H_PATH, H)
-        log(f"[OK] Saved W -> {NMF_W_PATH}")
-        log(f"[OK] Saved H -> {NMF_H_PATH}")
+    # Save the factorization for 04, 05, 07 and 08
+    np.save(NMF_W_PATH, W)
+    np.save(NMF_H_PATH, H)
+    log(f"[OK] Factorization saved -> {NMF_W_PATH.name}, {NMF_H_PATH.name}")
 
-    # --- primary / secondary archetype -------------------------------------
+    # --- Primary and secondary archetypes -----------------------------------
     sorted_idx = np.argsort(W, axis=1)[:, ::-1]
     top1_idx = sorted_idx[:, 0]
     top2_idx = sorted_idx[:, 1]
     top1_w = np.take_along_axis(W, top1_idx[:, None], axis=1).ravel()
     top2_w = np.take_along_axis(W, top2_idx[:, None], axis=1).ravel()
 
-    # --- metrics -----------------------------------------------------------
+    # --- Metrics ------------------------------------------------------------
     eps = 1e-9
     dominance_ratio = top1_w / (top2_w + eps)
     row_sums = W.sum(axis=1)
     relative_abundance = top1_w / np.where(row_sums == 0, 1, row_sums)
 
-    # --- classification: single criterion ----------------------------------
+    # --- Membership: single criterion ---------------------------------------
     is_core = relative_abundance >= CORE_RA_THRESHOLD
     membership = np.where(is_core, "Core Member", "Ambiguous")
 
-    # Sanity check: RA >= 0.80 gives the same partition as the alternative
-    # dominance-based rule, because RA >= 0.80 forces a dominance ratio >= 4.
-    alt = (dominance_ratio >= 2.0) & ((top1_w >= 0.3) | (relative_abundance >= 0.8))
-    n_diff = int((is_core != alt).sum())
-    log(f"[CHECK] Single criterion (RA>={CORE_RA_THRESHOLD}) vs alternative "
-        f"dominance rule - disagreeing species: {n_diff}")
+    # Sanity check against the earlier hybrid rule
+    hybrid = (dominance_ratio >= 2.0) & ((top1_w >= 0.3) | (relative_abundance >= 0.8))
+    n_diff = int((is_core != hybrid).sum())
+    log(f"[CHECK] single rule (RA>={CORE_RA_THRESHOLD}) vs earlier hybrid rule: "
+        f"{n_diff} species disagree")
     if n_diff == 0 and is_core.any():
-        log(f"        Identical partition. Minimum dominance ratio among Core "
-            f"species = {dominance_ratio[is_core].min():.3f} (>= 4 as expected)")
+        log(f"        Both rules give the same partition. Minimum dominance "
+            f"ratio among Core = {dominance_ratio[is_core].min():.3f} "
+            f"(>= 4 as expected)")
     elif n_diff:
-        log("[WARN] The two rules disagree; re-check the criterion.")
+        log("[WARN] The two rules disagree; re-check the membership criterion.")
 
-    log(f"[RESULT] {len(species_names)} species / "
+    log(f"[RESULT] {len(species_names)} species total / "
         f"Core Member {int(is_core.sum())} / Ambiguous {int((~is_core).sum())}")
     per_arch = (pd.Series(top1_idx[is_core] + 1)
                 .value_counts()
@@ -163,21 +157,21 @@ def generate_report(matrix, feature_names, species_names, db_path, k_val):
                 .tolist())
     log(f"       Core count per archetype 1..{k_val}: {per_arch}")
 
-    # --- Sheet 1: archetype signatures (top features of H) -----------------
+    # --- Sheet 1: archetype signatures (top features of H) ------------------
     sig_rows = []
     for k in range(k_val):
         for rank, idx in enumerate(np.argsort(H[k])[::-1][:10], 1):
             sig_rows.append({
                 "Archetype": k + 1,
-                "Cluster": k,                       # 0-based internal index
+                "Cluster": k,
                 "Rank": rank,
                 "Feature (Proteins)": feature_names[idx],
-                "Weight_H": H[k, idx],              # feature loadings are in H
+                "Weight_H": H[k, idx],
             })
     df_sig = pd.DataFrame(sig_rows)
 
-    # --- Sheet 2: membership and classification ----------------------------
-    df_tax = get_taxonomy_info(db_path, species_names)
+    # --- Sheet 2: membership and taxonomy -----------------------------------
+    df_tax = get_taxonomy_info(species_names)
     df_tax["Primary_Cluster"] = top1_idx
     df_tax["Archetype"] = top1_idx + 1
     df_tax["Secondary_Cluster"] = top2_idx
@@ -189,19 +183,14 @@ def generate_report(matrix, feature_names, species_names, db_path, k_val):
     df_tax["Membership_Status"] = membership
 
     for i in range(k_val):
-        df_tax[f"Weight_A{i + 1}"] = W[:, i]        # 1-based archetype columns
+        df_tax[f"Weight_A{i + 1}"] = W[:, i]
 
-    # Sort: archetype -> Core first -> dominance ratio descending
+    # Sort by archetype, Core first, then descending dominance ratio
     df_tax["_order"] = np.where(df_tax["Membership_Status"] == "Core Member", 0, 1)
     df_tax = (df_tax
               .sort_values(by=["Archetype", "_order", "Dominance_Ratio"],
                            ascending=[True, True, False])
               .drop(columns=["_order"]))
-
-    # --- persist membership CSV for downstream scripts (04, 05) -----------
-    if k_val == K:
-        df_tax.to_csv(NMF_MEMBERSHIP_PATH, index=False, encoding="utf-8-sig")
-        log(f"[OK] Membership CSV -> {NMF_MEMBERSHIP_PATH}")
 
     out_xlsx = RESULTS_DIR / f"NMF_Final_Analysis_K{k_val}_Step3_Advanced.xlsx"
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
@@ -209,26 +198,27 @@ def generate_report(matrix, feature_names, species_names, db_path, k_val):
         df_tax.to_excel(writer, sheet_name="2_Species_Membership", index=False)
     log(f"[OK] Report saved -> {out_xlsx}")
 
+    # Membership CSV consumed by 04, 05, 07 and 08
+    df_tax.to_csv(NMF_MEMBERSHIP_PATH, index=False, encoding="utf-8-sig")
+    log(f"[OK] Membership CSV saved -> {NMF_MEMBERSHIP_PATH.name}")
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# Main
+# ===========================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Fit NMF at the given K and export membership reports.")
-    parser.add_argument("k", type=int, nargs="*", default=[6],
-                        help="one or more K values (default: 6)")
-    args = parser.parse_args()
-    target_ks = args.k if args.k else [6]
+    matrix_norm, features, species = load_final_matrix(MATRIX_PATH)
 
-    matrix_norm, features, species = load_final_matrix(IN_MATRIX)
+    # Command-line arguments override the default K
+    if len(sys.argv) > 1:
+        target_ks = [int(v) for v in sys.argv[1:]]
+    else:
+        target_ks = [K]
     log(f"[RUN] target K: {target_ks}")
 
     for k in target_ks:
-        generate_report(matrix_norm, features, species, DB_PATH, k)
+        generate_report(matrix_norm, features, species, k)
 
-    (RESULTS_DIR / "cluster_analysis_log.txt").write_text(
-        "\n".join(_log), encoding="utf-8")
-    log(f"\n[DONE] Log -> {RESULTS_DIR / 'cluster_analysis_log.txt'}")
-    log("[NEXT] 04_figure_generation.py (figures) -> "
-        "05_statistical_analysis.py (statistics)")
+    log.save(RESULTS_DIR / "cluster_analysis_log.txt")
+    log(f"\n[DONE] log -> {RESULTS_DIR / 'cluster_analysis_log.txt'}")
+    log("[NEXT] 04_figure_generation.py -> 05_statistical_analysis.py")
