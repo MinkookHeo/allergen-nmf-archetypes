@@ -1,21 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-Generate the panels of Figure 2 and assemble them.
+04_figure_generation.py
 
-Loads precomputed NMF results (W matrix) from 03_cluster_analysis.py
-rather than refitting.
+Loads the factorization saved by 03 and builds Figure 2, then applies the A4
+post-processing step to the Figure 3 phylogenetic tree PDF exported from iTOL.
 
-Panels:
-    A  Top-10 taxonomic orders / families / conserved protein families
-    B  Compositional fingerprint of regulated representative species
-    C  Order-to-archetype alluvial (native matplotlib and Plotly HTML)
-    D  Dominance landscape (relative abundance vs dominance ratio)
+Figure 2 panels
+  (A) Top-10 bar plots (taxonomic order / family / conserved protein family)
+  (B) Dominance landscape, Core vs Ambiguous
+  (C) Archetype composition of regulated allergens (stacked bars)
+  (D) Alluvial diagram, taxonomic order vs archetype
+
+Panel D aggregates the continuous archetype weights rather than a single
+primary label, so species with mixed repertoires contribute to every archetype
+they load onto. 08_figure2d_audit.py verifies this aggregation.
 """
 
 import io
 import os
 import sqlite3
-import sys
 from pathlib import Path
 
 import matplotlib
@@ -33,42 +36,42 @@ from pypdf import PdfReader, PdfWriter, Transformation
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import white, black
 
-# ---------------------------------------------------------------------------
-# 0. Paths / constants (config.py)
-# ---------------------------------------------------------------------------
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# --- allow "from config import ..." when run from src/ -------------
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.append(str(_Path(__file__).resolve().parent.parent))
+# -------------------------------------------------------------------
 from config import (
-    DB_PATH, MATRIX_PATH, RESULTS_DIR, A4DIR,
-    NMF_W_PATH, NMF_MEMBERSHIP_PATH,
+    DB_PATH, MATRIX_PATH, RESULTS_DIR, FIGDIR, A4DIR, PHYLO_DIR,
+    NMF_W_PATH, NMF_H_PATH,
     K, RANDOM_STATE, CORE_RA_THRESHOLD,
     ARCH_HEX, ARCH_RGBA, CORE_COLOR, AMB_COLOR,
+    TAXONOMY_CORRECTIONS, MANUAL_ORDERS,
     cap_first, norm_name, set_journal_font,
 )
 
-IN_MATRIX = MATRIX_PATH
-FIGDIR = RESULTS_DIR
-
+# ===========================================================================
+# 0. Fonts
+# ===========================================================================
 set_journal_font()
 
-
-# ---------------------------------------------------------------------------
-# 1. Data pipeline (loads precomputed NMF from 03)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 1. Data pipeline
+# ===========================================================================
 def prepare_data():
-    raw = pd.read_csv(IN_MATRIX, index_col=0)
+    raw = pd.read_csv(MATRIX_PATH, index_col=0)
 
-    # Load precomputed W matrix; fall back to fitting if .npy is absent.
+    # Reuse the W matrix saved by 03 instead of refitting
     if NMF_W_PATH.exists():
         W = np.load(NMF_W_PATH)
-        print(f"[OK] Loaded W from {NMF_W_PATH}")
+        print(f"[OK] W loaded: {NMF_W_PATH.name}  shape={W.shape}")
     else:
-        from sklearn.decomposition import NMF
+        from sklearn.decomposition import NMF as _NMF
+        print("[WARN] W.npy not found -> refitting NMF (run 03 first)")
         matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
-        model = NMF(n_components=K, init="nndsvda", max_iter=5000,
-                    random_state=RANDOM_STATE)
+        model = _NMF(n_components=K, init="nndsvda",
+                      max_iter=5000, random_state=RANDOM_STATE)
         W = model.fit_transform(matrix_norm)
-        print("[WARN] W.npy not found; fitted NMF from scratch. "
-              "Run 03_cluster_analysis.py first for reproducibility.")
 
     order_idx = np.argsort(W, axis=1)[:, ::-1]
     top1_idx, top2_idx = order_idx[:, 0], order_idx[:, 1]
@@ -98,11 +101,12 @@ def prepare_data():
         tax = pd.read_sql_query(
             "SELECT Species, [Order] AS Ord, Family FROM SpeciesTaxonomy", conn)
         cr = pd.read_sql_query(
-            "SELECT Query_ID, Similar_Protein FROM Crossreactivity", conn)
+            'SELECT Query_ID, Similar_Protein FROM Crossreactivity', conn)
         pf = pd.read_sql_query(
             'SELECT Query, Superfamily, "Short name" AS Short_name '
             'FROM Protein_families', conn)
-        alg = pd.read_sql_query("SELECT genbank_ids, species FROM Allergens", conn)
+        alg = pd.read_sql_query(
+            'SELECT genbank_ids, species FROM Allergens', conn)
 
     tax["key"] = tax["Species"].apply(norm_name)
     valid = ~tax["Ord"].isin(["Not Found", "Unknown", None])
@@ -110,8 +114,22 @@ def prepare_data():
     map_family = tax[valid].drop_duplicates("key").set_index("key")["Family"]
 
     df_nmf["key"] = df_nmf["Display_Name"].apply(norm_name)
-    df_nmf["Order"] = df_nmf["key"].map(map_order)
-    df_nmf["Family"] = df_nmf["key"].map(map_family)
+
+    # Separate key for the taxonomy lookup; "key" stays as written for 07
+    df_nmf["tax_key"] = df_nmf["key"].replace(TAXONOMY_CORRECTIONS)
+    df_nmf["Order"] = df_nmf["tax_key"].map(map_order)
+    df_nmf["Family"] = df_nmf["tax_key"].map(map_family)
+
+    # Species the database cannot resolve fall back to the manual table
+    n_before = int(df_nmf["Order"].isna().sum())
+    df_nmf["Order"] = df_nmf["Order"].fillna(df_nmf["tax_key"].map(MANUAL_ORDERS))
+    n_manual = n_before - int(df_nmf["Order"].isna().sum())
+    if n_manual:
+        print(f"[TAX] Orders supplied from MANUAL_ORDERS: {n_manual}")
+    n_miss = int(df_nmf["Order"].isna().sum())
+    print(f"[TAX] {n_miss} species without an Order match")
+    for nm in df_nmf.loc[df_nmf["Order"].isna(), "Display_Name"]:
+        print(f"      unmatched: {nm}")
 
     pf["Superfamily"] = pf["Superfamily"].fillna("-")
     pf["Short_name"] = pf["Short_name"].fillna("Unknown")
@@ -123,36 +141,41 @@ def prepare_data():
     alg2["gid"] = alg2["gid"].str.strip()
     cr2 = cr.merge(alg2, left_on="Query_ID", right_on="gid", how="left")
     cr2["key"] = cr2["species"].apply(lambda x: norm_name(x) if pd.notna(x) else x)
-    cr2 = cr2.merge(tax[["key", "Ord", "Family"]].drop_duplicates("key"),
-                    on="key", how="left")
+    cr2 = cr2.merge(
+        tax[["key", "Ord", "Family"]].drop_duplicates("key"), on="key", how="left")
 
-    top_order = cr2[~cr2["Ord"].isin(["Not Found", "Unknown", None])]["Ord"].value_counts().head(10)
-    top_family = cr2[~cr2["Family"].isin(["Not Found", "Unknown", None])]["Family"].value_counts().head(10)
+    top_order = cr2[~cr2["Ord"].isin(
+        ["Not Found", "Unknown", None])]["Ord"].value_counts().head(10)
+    top_family = cr2[~cr2["Family"].isin(
+        ["Not Found", "Unknown", None])]["Family"].value_counts().head(10)
 
     top_order.index = [cap_first(x) for x in top_order.index]
     top_family.index = [cap_first(x) for x in top_family.index]
 
-    df_nmf.to_csv(FIGDIR / "figure_source_data.csv", index=False,
-                  encoding="utf-8-sig")
+    df_nmf.to_csv(FIGDIR / "figure_source_data.csv",
+                  index=False, encoding="utf-8-sig")
 
     return df_nmf, top_order, top_family, top_protfam
 
 
-# ---------------------------------------------------------------------------
-# 2. Panel modules
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 2. Panel drawing
+# ===========================================================================
 def draw_panel_A(axes, top_order, top_family, top_protfam, is_individual=False):
-    sns.barplot(x=top_order.values, y=top_order.index, color=ARCH_HEX[0], ax=axes[0])
-    axes[0].set_xlabel('Number of species'); axes[0].set_ylabel('')
+    sns.barplot(x=top_order.values, y=top_order.index,
+                color=ARCH_HEX[0], ax=axes[0])
+    axes[0].set_xlabel('Number of homologs'); axes[0].set_ylabel('')
     for lbl in axes[0].get_yticklabels():
         lbl.set_fontstyle('italic')
 
-    sns.barplot(x=top_family.values, y=top_family.index, color=ARCH_HEX[1], ax=axes[1])
-    axes[1].set_xlabel('Number of species'); axes[1].set_ylabel('')
+    sns.barplot(x=top_family.values, y=top_family.index,
+                color=ARCH_HEX[1], ax=axes[1])
+    axes[1].set_xlabel('Number of homologs'); axes[1].set_ylabel('')
     for lbl in axes[1].get_yticklabels():
         lbl.set_fontstyle('italic')
 
-    sns.barplot(x=top_protfam.values, y=top_protfam.index, color=ARCH_HEX[2], ax=axes[2])
+    sns.barplot(x=top_protfam.values, y=top_protfam.index,
+                color=ARCH_HEX[2], ax=axes[2])
     axes[2].set_xlabel('Number of homologs'); axes[2].set_ylabel('')
 
     for ax in axes:
@@ -168,8 +191,33 @@ def draw_panel_A(axes, top_order, top_family, top_protfam, is_individual=False):
 
 
 def draw_panel_B(ax, df_nmf, is_individual=False):
+    sns.scatterplot(
+        data=df_nmf, x="Relative_Abundance", y="Dominance_Ratio",
+        hue="Membership_Status",
+        palette={"Core Member": CORE_COLOR, "Ambiguous": AMB_COLOR},
+        alpha=0.75, edgecolor="k", s=60, ax=ax)
+    ax.axvline(0.80, color="gray", ls="--", lw=1.5, zorder=0)
+    ax.set_yscale("log")
+    ax.set_xlabel("Relative abundance of primary archetype\n(Core if >= 0.8)")
+    ax.set_ylabel("Dominance ratio (log scale)")
+    ax.get_legend().remove()
+
+    ax.text(0.58, 10**7.5, "Core\n(single-family dominant)",
+            color=CORE_COLOR, fontsize=11, ha="center", va="center")
+    ax.text(0.35, 10**3, "Ambiguous\n(multi-family)",
+            color=AMB_COLOR, fontsize=11, ha="center", va="bottom")
+    ax.spines[["top", "right"]].set_visible(False)
+
+    if is_individual:
+        ax.set_title("The Dominance Landscape")
+    else:
+        ax.text(-0.05, 1.05, '(B)', transform=ax.transAxes,
+                fontsize=18, va='bottom', ha='right')
+
+
+def draw_panel_C(ax, df_nmf, is_individual=False):
     REGULATED_REPS = [
-        ("Anacardium occidentale",      "Cashew"),
+        ("Anacardium occidentale",       "Cashew"),
         ("Sesamum indicum",             "Sesame"),
         ("Brassica juncea",             "Brown mustard"),
         ("Litopenaeus vannamei",        "Pacific white shrimp"),
@@ -185,9 +233,11 @@ def draw_panel_B(ax, df_nmf, is_individual=False):
         m = df_nmf[df_nmf["Display_Name"].str.contains(key, na=False, regex=False)]
         if m.empty:
             continue
-        r = m.iloc[0]; w = r[wc].to_numpy(dtype=float)
+        r = m.iloc[0]
+        w = r[wc].to_numpy(dtype=float)
         frac = w / w.sum()
-        dr = r["Dominance_Ratio"]; dr_str = "> 10³" if dr > 1000 else f"{dr:.1f}"
+        dr = r["Dominance_Ratio"]
+        dr_str = "> 10^3" if dr > 1000 else f"{dr:.1f}"
         rows_b.append((label, frac, dr_str, float(frac.max())))
 
     rows_b.sort(key=lambda x: x[3])
@@ -205,34 +255,63 @@ def draw_panel_B(ax, df_nmf, is_individual=False):
     ax.set_xlim(0, 1.0)
     ax.set_xlabel("Relative Archetype Contribution", fontsize=11)
 
-    handles = [Patch(facecolor=ARCH_HEX[a], label=f"Archetype {a+1}") for a in range(K)]
-    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.15),
-              ncol=3, frameon=False, fontsize=9)
+    handles = [Patch(facecolor=ARCH_HEX[a], label=f"Archetype {a+1}")
+               for a in range(K)]
+    ax.legend(handles=handles, loc="upper center",
+              bbox_to_anchor=(0.5, -0.15), ncol=3, frameon=False, fontsize=9)
     ax.spines[["top", "right"]].set_visible(False)
 
-    if not is_individual:
-        ax.text(-0.05, 1.05, '(B)', transform=ax.transAxes,
+    if is_individual:
+        ax.set_title("Regulated Allergens Composition")
+    else:
+        ax.text(-0.05, 1.05, '(C)', transform=ax.transAxes,
                 fontsize=18, va='bottom', ha='right')
 
 
 def _ribbon(ax, xL, xR, l_top, l_bot, r_top, r_bot, color, alpha=0.5):
     cx = (xL + xR) / 2.0
-    verts = [(xL, l_top), (cx, l_top), (cx, r_top), (xR, r_top), (xR, r_bot),
-             (cx, r_bot), (cx, l_bot), (xL, l_bot), (xL, l_top)]
-    codes = [MplPath.MOVETO, MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4,
-             MplPath.LINETO, MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4,
-             MplPath.CLOSEPOLY]
-    ax.add_patch(PathPatch(MplPath(verts, codes), facecolor=color,
-                           edgecolor="none", alpha=alpha))
+    verts = [
+        (xL, l_top), (cx, l_top), (cx, r_top), (xR, r_top),
+        (xR, r_bot), (cx, r_bot), (cx, l_bot), (xL, l_bot), (xL, l_top)]
+    codes = [
+        MplPath.MOVETO, MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4,
+        MplPath.LINETO, MplPath.CURVE4, MplPath.CURVE4, MplPath.CURVE4,
+        MplPath.CLOSEPOLY]
+    ax.add_patch(PathPatch(
+        MplPath(verts, codes), facecolor=color, edgecolor="none", alpha=alpha))
 
 
-def draw_panel_C_native(ax, df_nmf, is_individual=False):
-    target_orders = ["Poales", "Rosales", "Fagales", "Fabales", "Asterales",
-                     "Malpighiales", "Lamiales", "Malvales", "Zingiberales"]
-    sub = df_nmf[df_nmf["Order"].isin(target_orders)]
-    agg = sub.groupby(["Order", "Archetype"]).size().reset_index(name="Count")
+def draw_panel_D(ax, df_nmf, is_individual=False):
+    target_orders = [
+        "Poales", "Rosales", "Fagales", "Fabales", "Asterales",
+        "Malpighiales", "Lamiales", "Zingiberales"]
+
+    sub = df_nmf[df_nmf["Order"].isin(target_orders)].copy()
+
+    wc = [f"Weight_A{i+1}" for i in range(K)]
+    w_vals = sub[wc].to_numpy(dtype=float)
+    row_sums = w_vals.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    fracs = w_vals / row_sums
+
+    for i, c in enumerate(wc):
+        sub[f"Frac_A{i+1}"] = fracs[:, i]
+
+    order_sums = sub.groupby("Order")[
+        [f"Frac_A{i+1}" for i in range(K)]].sum()
+
+    agg_list = []
+    for order in order_sums.index:
+        for i in range(K):
+            val = order_sums.loc[order, f"Frac_A{i+1}"]
+            if val > 0.001:
+                agg_list.append(
+                    {"Order": order, "Archetype": i + 1, "Count": val})
+
+    agg = pd.DataFrame(agg_list)
     if agg.empty:
-        ax.axis("off"); return
+        ax.axis("off")
+        return
 
     orders = [o for o in target_orders if o in set(agg["Order"])]
     arch_list = sorted(int(a) for a in agg["Archetype"].unique())
@@ -242,7 +321,8 @@ def draw_panel_C_native(ax, df_nmf, is_individual=False):
 
     gap = 0.03
     nL, nR = len(orders), len(arch_list)
-    scale = min((1 - gap * (nL - 1)) / total, (1 - gap * (nR - 1)) / total)
+    scale = min(
+        (1 - gap * (nL - 1)) / total, (1 - gap * (nR - 1)) / total)
 
     def node_pos(items, totals, n):
         used = total * scale + gap * (n - 1)
@@ -264,59 +344,102 @@ def draw_panel_C_native(ax, df_nmf, is_individual=False):
     for o in orders:
         rows = agg[agg["Order"] == o].sort_values("Archetype")
         for _, r in rows.iterrows():
-            a = int(r["Archetype"]); h = float(r["Count"]) * scale
+            a = int(r["Archetype"])
+            h = float(r["Count"]) * scale
             lt = offL[o]; lb = lt - h; offL[o] = lb
             rt = offR[a]; rb = rt - h; offR[a] = rb
-            _ribbon(ax, xL1, xR0, lt, lb, rt, rb, ARCH_HEX[a - 1], alpha=0.5)
+            _ribbon(ax, xL1, xR0, lt, lb, rt, rb,
+                    ARCH_HEX[a - 1], alpha=0.5)
 
     for o in orders:
         t, b = posL[o]
-        ax.add_patch(Rectangle((xL0, b), xL1 - xL0, t - b,
-                               facecolor="lightgrey", edgecolor="none"))
-        ax.text(xL0 - 0.02, (t + b) / 2, cap_first(o), ha="right", va="center",
-                fontsize=11, fontstyle="italic")
+        ax.add_patch(Rectangle(
+            (xL0, b), xL1 - xL0, t - b,
+            facecolor="lightgrey", edgecolor="none"))
+        ax.text(xL0 - 0.02, (t + b) / 2, cap_first(o),
+                ha="right", va="center", fontsize=11, fontstyle="italic")
     for a in arch_list:
         t, b = posR[a]
-        ax.add_patch(Rectangle((xR0, b), xR1 - xR0, t - b,
-                               facecolor=ARCH_HEX[a - 1], edgecolor="none"))
-        ax.text(xR1 + 0.02, (t + b) / 2, f"Archetype {a}", ha="left",
-                va="center", fontsize=11)
+        ax.add_patch(Rectangle(
+            (xR0, b), xR1 - xR0, t - b,
+            facecolor=ARCH_HEX[a - 1], edgecolor="none"))
+        ax.text(xR1 + 0.02, (t + b) / 2, f"Archetype {a}",
+                ha="left", va="center", fontsize=11)
 
     ax.set_xlim(-0.18, 1.18)
     ax.set_ylim(-0.02, 1.02)
     ax.axis("off")
 
-    if not is_individual:
-        ax.text(-0.05, 1.05, '(C)', transform=ax.transAxes,
-                fontsize=18, va='bottom', ha='right')
-
-
-def draw_panel_D(ax, df_nmf, is_individual=False):
-    sns.scatterplot(data=df_nmf, x="Relative_Abundance", y="Dominance_Ratio",
-                    hue="Membership_Status",
-                    palette={"Core Member": CORE_COLOR, "Ambiguous": AMB_COLOR},
-                    alpha=0.75, edgecolor="k", s=60, ax=ax)
-    ax.axvline(0.80, color="gray", ls="--", lw=1.5, zorder=0)
-    ax.set_yscale("log")
-    ax.set_xlabel("Relative abundance of primary archetype\n(Core if ≥ 0.8)")
-    ax.set_ylabel("Dominance ratio (log scale)")
-    ax.get_legend().remove()
-    ax.text(0.90, ax.get_ylim()[1] * 0.4, "Core\n(single-family dominant)",
-            color=CORE_COLOR, fontsize=11, ha="center", va="top")
-    ax.text(0.35, 10**3, "Ambiguous\n(multi-family)",
-            color=AMB_COLOR, fontsize=11, ha="center", va="bottom")
-    ax.spines[["top", "right"]].set_visible(False)
-
     if is_individual:
-        ax.set_title("The Dominance Landscape")
+        ax.set_title("Phylogeny vs Archetypes Alluvial")
     else:
         ax.text(-0.05, 1.05, '(D)', transform=ax.transAxes,
                 fontsize=18, va='bottom', ha='right')
 
 
-# ---------------------------------------------------------------------------
-# 3. Figure assembly
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 3. Plotly HTML Alluvial
+# ===========================================================================
+def create_figure_2c_alluvial_html(df):
+    target_orders = [
+        "Poales", "Rosales", "Fagales", "Fabales", "Asterales",
+        "Malpighiales", "Lamiales", "Zingiberales"]
+    sub = df[df["Order"].isin(target_orders)].copy()
+
+    wc = [f"Weight_A{i+1}" for i in range(K)]
+    w_vals = sub[wc].to_numpy(dtype=float)
+    row_sums = w_vals.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    fracs = w_vals / row_sums
+
+    for i in range(K):
+        sub[f"Frac_A{i+1}"] = fracs[:, i]
+
+    order_sums = sub.groupby("Order")[
+        [f"Frac_A{i+1}" for i in range(K)]].sum()
+
+    agg_list = []
+    for order in order_sums.index:
+        for i in range(K):
+            val = order_sums.loc[order, f"Frac_A{i+1}"]
+            if val > 0.001:
+                agg_list.append(
+                    {"Order": order, "Archetype": i + 1, "Count": val})
+    agg = pd.DataFrame(agg_list)
+
+    orders = list(agg["Order"].unique())
+    arches = [f"Archetype {i}" for i in sorted(agg["Archetype"].unique())]
+    nodes = orders + arches
+    nidx = {n: i for i, n in enumerate(nodes)}
+
+    node_colors = [
+        ARCH_HEX[int(n.split(" ")[1]) - 1] if "Archetype" in n
+        else "lightgrey" for n in nodes]
+    link_colors = [ARCH_RGBA[int(t) - 1] for t in agg["Archetype"]]
+
+    fig = go.Figure(data=[go.Sankey(
+        node=dict(
+            pad=15, thickness=20,
+            line=dict(color="black", width=0.5),
+            label=nodes, color=node_colors),
+        link=dict(
+            source=agg["Order"].map(nidx),
+            target=agg["Archetype"].apply(
+                lambda x: f"Archetype {x}").map(nidx),
+            value=agg["Count"], color=link_colors)
+    )])
+    fig.update_layout(
+        title_text=("Concordance and Divergence Between Biological "
+                    "Phylogeny and Structural Allergenic Archetypes"),
+        font_size=18, width=1400, height=900)
+    out_html = FIGDIR / "Figure_2(c)_alluvial.html"
+    fig.write_html(str(out_html))
+    return out_html
+
+
+# ===========================================================================
+# 4. Individual panel PDFs
+# ===========================================================================
 def create_figure_2a_independent(top_order, top_family, top_protfam):
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     draw_panel_A(axes, top_order, top_family, top_protfam, is_individual=True)
@@ -327,8 +450,28 @@ def create_figure_2a_independent(top_order, top_family, top_protfam):
     return out_pdf
 
 
-def create_figure_2d_independent(df_nmf):
+def create_figure_2b_independent(df_nmf):
     fig, ax = plt.subplots(figsize=(8, 8))
+    draw_panel_B(ax, df_nmf, is_individual=True)
+    plt.tight_layout()
+    out_pdf = FIGDIR / "Figure_2(b)_raw.pdf"
+    plt.savefig(out_pdf, bbox_inches="tight")
+    plt.close()
+    return out_pdf
+
+
+def create_figure_2c_independent(df_nmf):
+    fig, ax = plt.subplots(figsize=(10, 8))
+    draw_panel_C(ax, df_nmf, is_individual=True)
+    plt.tight_layout()
+    out_pdf = FIGDIR / "Figure_2(c)_raw.pdf"
+    plt.savefig(out_pdf, bbox_inches="tight")
+    plt.close()
+    return out_pdf
+
+
+def create_figure_2d_independent(df_nmf):
+    fig, ax = plt.subplots(figsize=(10, 8))
     draw_panel_D(ax, df_nmf, is_individual=True)
     plt.tight_layout()
     out_pdf = FIGDIR / "Figure_2(d)_raw.pdf"
@@ -337,44 +480,16 @@ def create_figure_2d_independent(df_nmf):
     return out_pdf
 
 
-def create_figure_2c_alluvial_html(df):
-    target_orders = ["Poales", "Rosales", "Fagales", "Fabales", "Asterales",
-                     "Malpighiales", "Lamiales", "Malvales", "Zingiberales"]
-    sub = df[df["Order"].isin(target_orders)]
-    agg = sub.groupby(["Order", "Archetype"]).size().reset_index(name="Count")
-    orders = list(agg["Order"].unique())
-    arches = [f"Archetype {i}" for i in sorted(agg["Archetype"].unique())]
-    nodes = orders + arches
-    nidx = {n: i for i, n in enumerate(nodes)}
-
-    node_colors = [ARCH_HEX[int(n.split(" ")[1]) - 1] if "Archetype" in n
-                   else "lightgrey" for n in nodes]
-    link_colors = [ARCH_RGBA[int(t_arch) - 1] for t_arch in agg["Archetype"]]
-
-    fig = go.Figure(data=[go.Sankey(
-        node=dict(pad=15, thickness=20, line=dict(color="black", width=0.5),
-                  label=nodes, color=node_colors),
-        link=dict(source=agg["Order"].map(nidx),
-                  target=agg["Archetype"].apply(lambda x: f"Archetype {x}").map(nidx),
-                  value=agg["Count"], color=link_colors)
-    )])
-    fig.update_layout(
-        title_text="Concordance and divergence between biological phylogeny "
-                   "and structural allergenic archetypes",
-        font_size=18, width=1400, height=900)
-    out_html = FIGDIR / "Figure_2(c)_alluvial.html"
-    fig.write_html(str(out_html))
-    return out_html
-
-
 def create_figure_2_combined(df_nmf, top_order, top_family, top_protfam):
-    fig, axes = plt.subplots(2, 3, figsize=(16, 9),
-                             gridspec_kw={"width_ratios": [1, 1.4, 1]})
+    fig, axes = plt.subplots(
+        2, 3, figsize=(16, 9),
+        gridspec_kw={"width_ratios": [1.1, 1.0, 1.1]})
 
-    draw_panel_A([axes[0, 0], axes[0, 1], axes[0, 2]],
-                 top_order, top_family, top_protfam, is_individual=False)
+    draw_panel_A(
+        [axes[0, 0], axes[0, 1], axes[0, 2]],
+        top_order, top_family, top_protfam, is_individual=False)
     draw_panel_B(axes[1, 0], df_nmf, is_individual=False)
-    draw_panel_C_native(axes[1, 1], df_nmf, is_individual=False)
+    draw_panel_C(axes[1, 1], df_nmf, is_individual=False)
     draw_panel_D(axes[1, 2], df_nmf, is_individual=False)
 
     plt.tight_layout()
@@ -384,10 +499,11 @@ def create_figure_2_combined(df_nmf, top_order, top_family, top_protfam):
     return out_pdf
 
 
-# ---------------------------------------------------------------------------
-# 4. A4 formatting (post-processing)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 5. A4 portrait composition (pypdf + reportlab)
+# ===========================================================================
 def apply_a4_formatting(pdf_tasks):
+    """Place each Figure 2 panel on an A4 portrait page."""
     MM = 72.0 / 25.4
     A4_W, A4_H = 210 * MM, 297 * MM
     margin = 15 * MM
@@ -411,7 +527,8 @@ def apply_a4_formatting(pdf_tasks):
         src = PdfReader(src_pdf_path)
         sp = src.pages[0]
 
-        left, bottom = float(sp.mediabox.left), float(sp.mediabox.bottom)
+        left = float(sp.mediabox.left)
+        bottom = float(sp.mediabox.bottom)
         sw, sh = float(sp.mediabox.width), float(sp.mediabox.height)
 
         avail_w = A4_W - 2 * margin
@@ -437,33 +554,127 @@ def apply_a4_formatting(pdf_tasks):
         with open(final_pdf_path, "wb") as f:
             writer.write(f)
 
-        # Keep only the A4-formatted output.
         os.remove(src_pdf_path)
         print(f"[A4] {final_pdf_path.name}")
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 6. Figure 3 post-processing
+# ===========================================================================
+def format_figure3_a4():
+    """Crop the whitespace around the Figure 3 tree and compose it on A4."""
+    try:
+        import pymupdf
+    except ImportError:
+        print("[WARN] pymupdf not installed -> skipping Figure 3 post-processing")
+        return
+
+    input_pdf = PHYLO_DIR / "Figure_3.pdf"
+    if not input_pdf.exists():
+        print(f"[SKIP] Figure 3 source not found: {input_pdf}")
+        return
+
+    MM = 72.0 / 25.4
+    A4_W, A4_H = 210 * MM, 297 * MM
+    MARGIN = 15 * MM
+    LEGEND_SPACE = 45 * MM
+
+    # Step 1. Crop whitespace
+    doc = pymupdf.open(input_pdf)
+    page = doc[0]
+
+    rects = []
+    for block in page.get_text("blocks"):
+        rects.append(pymupdf.Rect(block[:4]))
+    for drawing in page.get_drawings():
+        rects.append(drawing["rect"])
+
+    if not rects:
+        print("[WARN] Could not detect the content area of Figure 3")
+        doc.close()
+        return
+
+    content_rect = rects[0]
+    for r in rects[1:]:
+        content_rect |= r
+
+    padding = 10
+    crop_rect = pymupdf.Rect(
+        content_rect.x0 - padding, content_rect.y0 - padding,
+        content_rect.x1 + padding, content_rect.y1 + padding)
+    page.set_cropbox(crop_rect)
+
+    cropped_path = PHYLO_DIR / "Figure_3_CROPPED.pdf"
+    doc.save(cropped_path)
+    doc.close()
+
+    # Step 2. Compose on A4
+    cropped_doc = pymupdf.open(cropped_path)
+    src_page = cropped_doc[0]
+    crop_box = src_page.cropbox
+    sw, sh = crop_box.width, crop_box.height
+
+    avail_w = A4_W - 2 * MARGIN
+    avail_h = A4_H - MARGIN - (MARGIN + LEGEND_SPACE)
+    scale = min(avail_w / sw, avail_h / sh)
+    fw, fh = sw * scale, sh * scale
+
+    tx = MARGIN + (avail_w - fw) / 2.0
+    ty = MARGIN
+
+    a4_doc = pymupdf.open()
+    a4_page = a4_doc.new_page(width=A4_W, height=A4_H)
+
+    target_rect = pymupdf.Rect(tx, ty, tx + fw, ty + fh)
+    a4_page.show_pdf_page(target_rect, cropped_doc, 0, clip=crop_box)
+
+    label_text = "Figure 3_Heo and Rhee"
+    font_size = 10
+    text_len = pymupdf.get_text_length(
+        label_text, fontname="helv", fontsize=font_size)
+    label_x = A4_W - MARGIN - text_len
+    label_y = A4_H - MARGIN
+    a4_page.insert_text(
+        (label_x, label_y), label_text,
+        fontname="helv", fontsize=font_size, color=(0, 0, 0))
+
+    a4_output = A4DIR / "Figure_3.pdf"
+    a4_doc.save(a4_output)
+    a4_doc.close()
+    cropped_doc.close()
+
+    print(f"[A4] Figure 3 -> {a4_output.name}")
+
+
+# ===========================================================================
+# Main
+# ===========================================================================
 if __name__ == "__main__":
-    print("1. Loading data and NMF results...")
+    print("1. Loading the factorization and preparing data...")
     df_nmf, top_order, top_family, top_protfam = prepare_data()
 
     print("2. Building individual panels...")
     fig2a_pdf = create_figure_2a_independent(top_order, top_family, top_protfam)
+    fig2b_pdf = create_figure_2b_independent(df_nmf)
+    fig2c_pdf = create_figure_2c_independent(df_nmf)
     fig2d_pdf = create_figure_2d_independent(df_nmf)
     fig2c_html = create_figure_2c_alluvial_html(df_nmf)
-    print(f"[HTML] {fig2c_html.name}")
+    print(f"   [HTML] {fig2c_html.name}")
 
-    print("3. Assembling the combined 2x3 Figure 2...")
+    print("3. Assembling Figure 2...")
     fig2_pdf = create_figure_2_combined(df_nmf, top_order, top_family, top_protfam)
 
-    print("4. Applying A4 formatting and author caption...")
+    print("4. Applying A4 layout to Figure 2...")
     pdf_tasks = [
         (fig2a_pdf, "Figure 2(a)"),
+        (fig2b_pdf, "Figure 2(b)"),
+        (fig2c_pdf, "Figure 2(c)"),
         (fig2d_pdf, "Figure 2(d)"),
         (fig2_pdf,  "Figure 2"),
     ]
     apply_a4_formatting(pdf_tasks)
 
-    print(f"\n[DONE] Figures saved to {FIGDIR}")
+    print("5. Post-processing Figure 3...")
+    format_figure3_a4()
+
+    print("\n[DONE] Figure 2 and Figure 3 written.")
