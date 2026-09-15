@@ -3,8 +3,8 @@
 Centralized paths, constants, palettes and utility functions.
 
 All scripts import from this module. Edit nothing if you keep the
-default folder layout; only BASE_DIR / PROJECT_DIR need changing
-for a relocated checkout.
+default folder layout; only PROJECT_DIR needs changing for a
+relocated checkout.
 """
 
 from pathlib import Path
@@ -20,6 +20,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "data"
 SRC_DIR = PROJECT_DIR / "src"
 RESULTS_DIR = PROJECT_DIR / "results"
+FIGDIR = RESULTS_DIR                       # figures are written to results/
 A4DIR = RESULTS_DIR / "A4_formatted"
 PHYLO_DIR = DATA_DIR / "phylogeny"
 CACHE_DIR = RESULTS_DIR / "consensus_cache"
@@ -28,7 +29,7 @@ CACHE_DIR = RESULTS_DIR / "consensus_cache"
 DB_PATH = DATA_DIR / "allergen_database.sqlite"
 MATRIX_PATH = DATA_DIR / "allergen_source_matrix.csv"
 
-# NMF artefacts produced by 03, consumed by 04 and 05
+# NMF artefacts produced by 03, consumed by 04, 05, 07 and 08
 NMF_W_PATH = RESULTS_DIR / "nmf_W.npy"
 NMF_H_PATH = RESULTS_DIR / "nmf_H.npy"
 NMF_MEMBERSHIP_PATH = RESULTS_DIR / "figure_source_data.csv"
@@ -59,7 +60,54 @@ CORE_COLOR = '#D55E00'
 AMB_COLOR = '#0072B2'
 
 # ============================================================================
-# 4. Utility functions
+# 4. Taxonomic synonym maps
+# ============================================================================
+# Display names whose binomials differ from the accepted NCBI name.
+# Used by 07 to match tips of the phyloT / NCBI Common Tree.
+BIOLOGICAL_MAP = {
+    "Acacia farnesiana": "Vachellia farnesiana",
+    "Bos domesticus": "Bos taurus",
+    "Crassostrea angulata [Magallana angulata]": "Magallana angulata",
+    "Crassostrea gigas [Magallana gigas]": "Magallana gigas",
+    "Gadus callarias": "Gadus morhua",
+    "Kali turgidum [Salsola kali]": "Salsola kali",
+    "Kochia scoparia [Bassia scoparia]": "Bassia scoparia",
+    "Litopenaeus vannamei": "Penaeus vannamei",
+    "Melicertus latisulcatus": "Penaeus latisulcatus",
+    "Prosopis juliflora": "Neltuma juliflora",
+    "Rana esculenta": "Pelophylax ridibundus",
+    "Sebastes marinus [S. norvegicus]": "Sebastes norvegicus",
+    "Triticum turgidum ssp durum": "Triticum turgidum subsp. durum",
+}
+
+# phyloT accepts NCBI TaxIDs for a few tips that resolve ambiguously by name
+PHYLOT_CORRECTIONS = {
+    **BIOLOGICAL_MAP,
+    "Gadus callarias": "8053",
+    "Rana esculenta": "8406",
+}
+
+# Display names whose binomials differ from the SpeciesTaxonomy entries.
+# Applied before the Order / Family lookup in 03, 04 and 05.
+TAXONOMY_CORRECTIONS = {
+    "Bos domesticus": "Bos taurus",
+    "Gallus domesticus": "Gallus gallus",
+    "Rana esculenta": "Pelophylax ridibundus",
+    "Triticum turgidum ssp durum": "Triticum turgidum subsp. durum",
+}
+
+# Species absent from SpeciesTaxonomy, or present without an Order value.
+# Orders follow the same NCBI Taxonomy revision used elsewhere in the table.
+MANUAL_ORDERS = {
+    "Lates calcarifer": "Carangiformes",
+    "Pelophylax ridibundus": "Anura",
+    "Bos taurus": "Artiodactyla",
+    "Gallus gallus": "Galliformes",
+    "Triticum turgidum subsp. durum": "Poales",
+}
+
+# ============================================================================
+# 5. Utility functions
 # ============================================================================
 def cap_first(s):
     """Capitalise only the first letter; leave the rest unchanged."""
@@ -89,3 +137,20 @@ def set_journal_font():
     plt.rcParams["font.size"] = 12
     plt.rcParams["pdf.fonttype"] = 42
     plt.rcParams["ps.fonttype"] = 42
+
+
+# ============================================================================
+# 6. Logging helper
+# ============================================================================
+class Logger:
+    """Print to console and accumulate lines for a run log."""
+
+    def __init__(self):
+        self._lines = []
+
+    def __call__(self, msg=""):
+        print(msg)
+        self._lines.append(str(msg))
+
+    def save(self, path):
+        Path(path).write_text("\n".join(self._lines), encoding="utf-8")
