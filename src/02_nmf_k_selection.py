@@ -2,12 +2,11 @@
 """
 02_nmf_k_selection.py
 
-Runs NMF consensus clustering over a range of K on allergen_source_matrix.csv
-and computes the rank-selection metrics (cophenetic correlation, RSS, delta
-area under the consensus CDF) together with the consensus matrices.
+Runs NMF consensus clustering on allergen_source_matrix.csv and computes the
+K-selection metrics (cophenetic correlation / RSS / delta area) and consensus
+matrices.
 
-Output: Figure 1 (3x3 layout; three metric panels and six consensus heatmaps).
-Consensus heatmaps default to K = 3-8 and can be overridden on the command line.
+Output: manuscript Figure 1 (3x3: 3 metric panels + 6 consensus heatmaps).
 """
 
 import sys
@@ -22,25 +21,20 @@ from scipy.spatial.distance import squareform
 from sklearn.decomposition import NMF
 from sklearn.preprocessing import Normalizer
 
-# --- allow "from config import ..." when run from src/ -------------
-import sys as _sys
-from pathlib import Path as _Path
-_sys.path.append(str(_Path(__file__).resolve().parent.parent))
-# -------------------------------------------------------------------
 from config import (
     MATRIX_PATH, RESULTS_DIR, CACHE_DIR,
     set_journal_font,
 )
 
 # ===========================================================================
-# 0. Paths
+# 0. Paths / setup
 # ===========================================================================
 set_journal_font()
 
 IN_MATRIX = MATRIX_PATH
 OUT_METRICS = RESULTS_DIR / "NMF_K_selection_metrics.csv"
 
-# Figure 1
+# Manuscript Figure 1
 OUT_FIG_COMBINED = RESULTS_DIR / "Figure_1.png"
 OUT_FIG_PDF = RESULTS_DIR / "Figure_1.pdf"
 
@@ -71,10 +65,11 @@ def load_processed_data(file_path):
 
 # ===========================================================================
 # 2. Consensus matrix (cached)
+#    Cache key includes N_RUNS so a changed run count is not silently reused.
 # ===========================================================================
 def build_consensus(matrix, k, n_runs=N_RUNS, use_cache=True):
-    cache_c = CACHE_DIR / f"consensus_K{k}.npy"
-    cache_r = CACHE_DIR / f"rss_K{k}.npy"
+    cache_c = CACHE_DIR / f"consensus_K{k}_n{n_runs}.npy"
+    cache_r = CACHE_DIR / f"rss_K{k}_n{n_runs}.npy"
 
     if use_cache and cache_c.exists() and cache_r.exists():
         return np.load(cache_c), float(np.load(cache_r))
@@ -117,13 +112,13 @@ def cophenetic_corr(consensus):
 
 
 # ===========================================================================
-# 3. Main
+# 3. Run
 # ===========================================================================
 if __name__ == "__main__":
     t0 = time.time()
 
     matrix_norm, feature_names, species_names = load_processed_data(IN_MATRIX)
-    print(f"[OK] Input matrix: {matrix_norm.shape[0]} species x {matrix_norm.shape[1]} features")
+    print(f"[OK] input matrix: {matrix_norm.shape[0]} species x {matrix_norm.shape[1]} features")
     print(f"[RUN] K={list(K_RANGE)}, runs={N_RUNS}\n")
 
     rows = []
@@ -136,23 +131,24 @@ if __name__ == "__main__":
 
     met = pd.DataFrame(rows)
 
-    # Delta area
+    # Delta area (relative change in CDF area vs the previous K).
+    # The first K has no predecessor, so its delta is undefined (NaN).
     auc = met["CDF_area"].to_numpy()
     delta = np.empty_like(auc)
-    delta[0] = auc[0]
+    delta[0] = np.nan
     delta[1:] = (auc[1:] - auc[:-1]) / auc[:-1]
     met["delta_area"] = delta
 
     met.to_csv(OUT_METRICS, index=False, encoding="utf-8-sig")
-    print(f"\n[OK] Metrics saved -> {OUT_METRICS}")
+    print(f"\n[OK] metrics saved -> {OUT_METRICS}")
 
     # =======================================================================
-    # Assemble Figure 1 (3x3 layout)
+    # Combined Figure 1 (3x3 layout)
     # =======================================================================
     fig, axes = plt.subplots(3, 3, figsize=(16, 16))
     k_list = met["K"]
 
-    # --- Row 1: rank-selection metrics (A, B, C) ---
+    # --- Row 1: K-selection metrics (A, B, C) ---
     color_A, color_B, color_C = '#1B9E77', '#D95F02', '#7570B3'
 
     # (A) Cophenetic correlation
@@ -187,7 +183,7 @@ if __name__ == "__main__":
     sns.despine(ax=axes[0, 2])
 
     # --- Rows 2-3: consensus heatmaps (D) ---
-    # Command-line arguments override the default K range
+    # CLI argument or default [3, 4, 5, 6, 7, 8]
     if len(sys.argv) > 1:
         target_ks = [int(v) for v in sys.argv[1:]]
     else:
@@ -222,7 +218,7 @@ if __name__ == "__main__":
     plt.tight_layout()
     plt.savefig(OUT_FIG_COMBINED, dpi=600, bbox_inches="tight")
     plt.savefig(OUT_FIG_PDF, bbox_inches="tight")
-    print(f"\n[OK] Figure 1 saved -> {OUT_FIG_COMBINED} / {OUT_FIG_PDF}")
+    print(f"\n[OK] combined 3x3 figure saved -> {OUT_FIG_COMBINED} / {OUT_FIG_PDF}")
     plt.close()
 
-    print(f"\n[DONE] Elapsed: {time.time() - t0:.1f} s")
+    print(f"\n[DONE] elapsed: {time.time() - t0:.1f}s")
