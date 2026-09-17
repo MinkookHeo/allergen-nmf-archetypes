@@ -1,21 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-05_Statistical_Analysis.py
+05_statistical_analysis.py
 
 Compute every statistic reported in the manuscript.
 
 Sections:
-  [1] COUNTS      descriptive statistics (Core/Ambiguous, per-archetype counts)
+  [1] COUNTS      descriptive statistics (Core/Distributed, per-archetype counts)
   [2] BIAS        test whether repertoire entropy is an annotation artifact
   [3] RAREFACTION entropy rank stability after equalizing sequencing depth
   [4] AMI         archetype vs taxonomy agreement with a permutation null
-
-The factorization saved by 03 is reused; the model is refitted only for the
-rarefaction step, which requires model.transform().
 """
 
 import sqlite3
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -24,11 +20,6 @@ from scipy.stats import rankdata
 from sklearn.metrics import adjusted_mutual_info_score
 from sklearn.preprocessing import Normalizer
 
-# --- allow "from config import ..." when run from src/ -------------
-import sys as _sys
-from pathlib import Path as _Path
-_sys.path.append(str(_Path(__file__).resolve().parent.parent))
-# -------------------------------------------------------------------
 from config import (
     DB_PATH, MATRIX_PATH, RESULTS_DIR,
     NMF_W_PATH, NMF_H_PATH,
@@ -199,14 +190,14 @@ def main():
         log(f"[WARN] {len(zero_rows)} species have no assignable conserved "
             f"domain: {zero_rows}")
 
-    # Reuse the factorization saved by 03
+    # Load W/H saved by 03 instead of recomputing NMF.
     if NMF_W_PATH.exists() and NMF_H_PATH.exists():
         W = np.load(NMF_W_PATH)
         H = np.load(NMF_H_PATH)
-        log(f"[OK] Factorization loaded: W{W.shape}, H{H.shape}")
+        log(f"[OK] NMF results loaded: W{W.shape}, H{H.shape}")
     else:
         from sklearn.decomposition import NMF
-        log("[WARN] W/H .npy not found -> refitting NMF (run 03 first)")
+        log("[WARN] W/H .npy missing -> recomputing NMF (run 03 first)")
         matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
         model = NMF(n_components=K, init="nndsvda",
                     max_iter=5000, random_state=RANDOM_STATE)
@@ -234,7 +225,7 @@ def main():
     alt = (dom_ratio >= 2.0) & ((t1 >= 0.3) | (rel_ab >= 0.8))
     log(f"  total species                    : {len(raw)}")
     log(f"  Core Member (RA >= {CORE_RA_THRESHOLD})        : {int(core.sum())}")
-    log(f"  Ambiguous                        : {int((~core).sum())}")
+    log(f"  Distributed                      : {int((~core).sum())}")
     log(f"  disagreement with alt. rule      : {int((core != alt).sum())} species")
     if core.any():
         log(f"  min dominance ratio among Core   : {dom_ratio[core].min():.3f}"
@@ -252,7 +243,7 @@ def main():
         "Entropy": entropy,
         "Relative_Abundance": rel_ab,
         "Dominance_Ratio": dom_ratio,
-        "Membership_Status": np.where(core, "Core Member", "Ambiguous"),
+        "Membership_Status": np.where(core, "Core Member", "Distributed"),
         "Feature_Richness": (raw > 0).sum(axis=1).to_numpy(),
         "Total_Bitscore": raw.sum(axis=1).to_numpy(),
     })
@@ -346,7 +337,8 @@ def main():
     log(f"  target depth = {target:,} (10th percentile of positive depths), "
         f"{int(keep.sum())} / {len(depth)} species")
 
-    # Rarefaction needs model.transform(), so the model is refitted here
+    # Rarefaction needs NMF.transform(), so refit the model
+    # (deterministic: nndsvda + fixed random_state matches the saved W).
     from sklearn.decomposition import NMF as _NMF
     matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
     model = _NMF(n_components=K, init="nndsvda",
@@ -398,20 +390,20 @@ def main():
     tax["key"] = tax["Species"].apply(norm_name)
     valid = ~tax["Ord"].isin(["Not Found", "Unknown", None])
 
-    # Separate key for the taxonomy lookup; "key" still joins the DB profile
+    # taxonomy-only key (the DB-profile join key is left untouched)
     df["tax_key"] = df["key"].replace(TAXONOMY_CORRECTIONS)
     df["Order"] = df["tax_key"].map(
         tax[valid].drop_duplicates("key").set_index("key")["Ord"])
 
-    # Species the database cannot resolve fall back to the manual table
+    # Fill species unresolved by the DB with the manual overrides.
     n_before = int(df["Order"].isna().sum())
     df["Order"] = df["Order"].fillna(df["tax_key"].map(MANUAL_ORDERS))
     n_manual = n_before - int(df["Order"].isna().sum())
     if n_manual:
-        log(f"  Orders supplied from MANUAL_ORDERS: {n_manual}")
+        log(f"  filled by MANUAL_ORDERS: {n_manual}")
     n_miss = int(df["Order"].isna().sum())
     if n_miss:
-        log(f"  [WARN] {n_miss} species without an Order are excluded from AMI")
+        log(f"  [WARN] {n_miss} species without Order are excluded from AMI")
         for nm in df.loc[df["Order"].isna(), "Display_Name"]:
             log(f"         - {nm}")
 
