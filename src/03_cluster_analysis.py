@@ -2,14 +2,13 @@
 """
 03_cluster_analysis.py
 
-Applies NMF at rank K to allergen_source_matrix.csv and writes the per-species
-archetype membership table as an Excel report.
+Applies NMF (K) to allergen_source_matrix.csv and writes the per-species
+archetype membership as an Excel report.
 
-Core membership follows a single criterion, a relative archetype weight of at
-least 0.80 for the primary archetype; all other species are labelled Ambiguous.
+The NMF results (W, H) are saved as .npy so that downstream scripts (04, 05)
+can load them without recomputation.
 
-The factorization (W, H) is saved as .npy so that 04, 05, 07 and 08 can reuse it
-without refitting the model.
+Dependencies: pandas numpy scikit-learn openpyxl
 """
 
 import sqlite3
@@ -20,11 +19,6 @@ import pandas as pd
 from sklearn.decomposition import NMF
 from sklearn.preprocessing import Normalizer
 
-# --- allow "from config import ..." when run from src/ -------------
-import sys as _sys
-from pathlib import Path as _Path
-_sys.path.append(str(_Path(__file__).resolve().parent.parent))
-# -------------------------------------------------------------------
 from config import (
     DB_PATH, MATRIX_PATH, RESULTS_DIR,
     NMF_W_PATH, NMF_H_PATH, NMF_MEMBERSHIP_PATH,
@@ -43,7 +37,7 @@ log = Logger()
 # 1. Load and preprocess
 # ===========================================================================
 def load_final_matrix(file_path):
-    """log1p transform followed by row-wise (per-species) L1 normalization."""
+    """log1p transform, then row-wise (species) L1 normalization."""
     if not file_path.exists():
         log(f"[ERROR] File not found: {file_path}")
         sys.exit(1)
@@ -54,15 +48,15 @@ def load_final_matrix(file_path):
     if zero_rows:
         log(f"[WARN] {len(zero_rows)} species have no assignable conserved "
             f"domain: {zero_rows}")
-        log("       Their W rows are zero, so they fall into Ambiguous.")
+        log("       Their W rows are 0 and are therefore classified as Distributed.")
 
     matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(df))
-    log(f"[OK] Ready: {df.shape[0]} species x {df.shape[1]} protein families")
+    log(f"[OK] ready: {df.shape[0]} species x {df.shape[1]} families")
     return matrix_norm, df.columns, df.index
 
 
 # ===========================================================================
-# 2. Taxonomy mapping from SQLite
+# 2. SQLite taxonomy mapping
 # ===========================================================================
 def get_taxonomy_info(species_list):
     base = pd.DataFrame({"Display_Name": list(species_list)})
@@ -87,26 +81,27 @@ def get_taxonomy_info(species_list):
     base["Order"] = base["key"].map(map_order)
     base["Family"] = base["key"].map(map_family)
 
-    # Species the database cannot resolve fall back to the manual table
+    # Fill species unresolved by the DB with the manual overrides.
     n_before = int(base["Order"].isna().sum())
     base["Order"] = base["Order"].fillna(base["key"].map(MANUAL_ORDERS))
     n_manual = n_before - int(base["Order"].isna().sum())
     if n_manual:
-        log(f"[OK] Orders supplied from MANUAL_ORDERS: {n_manual}")
+        log(f"[OK] filled by MANUAL_ORDERS: {n_manual}")
 
     n_miss = int(base["Order"].isna().sum())
-    log(f"[OK] Taxonomy mapping: {n_miss} species without an Order match")
+    log(f"[OK] taxonomy mapping: {n_miss} species without Order")
     for nm in base.loc[base["Order"].isna(), "Display_Name"]:
         log(f"      unmatched: {nm}")
 
     return base.drop(columns=["key"])
+
 
 # ===========================================================================
 # 3. Analysis and report
 # ===========================================================================
 def generate_report(matrix, feature_names, species_names, k_val):
     log(f"\n{'=' * 62}")
-    log(f"[RUN] K={k_val}")
+    log(f"[RUN] K={k_val} analysis")
     log("=" * 62)
 
     model = NMF(n_components=k_val, init="nndsvda",
@@ -115,49 +110,49 @@ def generate_report(matrix, feature_names, species_names, k_val):
     H = model.components_                # archetype x feature
     log(f"[OK] NMF K={k_val}: W{W.shape}, H{H.shape}")
 
-    # Save the factorization for 04, 05, 07 and 08
+    # Save NMF results (loaded by downstream scripts)
     np.save(NMF_W_PATH, W)
     np.save(NMF_H_PATH, H)
-    log(f"[OK] Factorization saved -> {NMF_W_PATH.name}, {NMF_H_PATH.name}")
+    log(f"[OK] NMF results saved -> {NMF_W_PATH.name}, {NMF_H_PATH.name}")
 
-    # --- Primary and secondary archetypes -----------------------------------
+    # --- primary / secondary archetype ------------------------------------
     sorted_idx = np.argsort(W, axis=1)[:, ::-1]
     top1_idx = sorted_idx[:, 0]
     top2_idx = sorted_idx[:, 1]
     top1_w = np.take_along_axis(W, top1_idx[:, None], axis=1).ravel()
     top2_w = np.take_along_axis(W, top2_idx[:, None], axis=1).ravel()
 
-    # --- Metrics ------------------------------------------------------------
+    # --- metrics ----------------------------------------------------------
     eps = 1e-9
     dominance_ratio = top1_w / (top2_w + eps)
     row_sums = W.sum(axis=1)
     relative_abundance = top1_w / np.where(row_sums == 0, 1, row_sums)
 
-    # --- Membership: single criterion ---------------------------------------
+    # --- classification: single criterion (manuscript 2.4) ----------------
     is_core = relative_abundance >= CORE_RA_THRESHOLD
-    membership = np.where(is_core, "Core Member", "Ambiguous")
+    membership = np.where(is_core, "Core Member", "Distributed")
 
-    # Sanity check against the earlier hybrid rule
+    # Self-check against a previous hybrid rule
     hybrid = (dominance_ratio >= 2.0) & ((top1_w >= 0.3) | (relative_abundance >= 0.8))
     n_diff = int((is_core != hybrid).sum())
-    log(f"[CHECK] single rule (RA>={CORE_RA_THRESHOLD}) vs earlier hybrid rule: "
-        f"{n_diff} species disagree")
+    log(f"[CHECK] single rule (RA>={CORE_RA_THRESHOLD}) vs previous hybrid rule "
+        f"disagreements: {n_diff}")
     if n_diff == 0 and is_core.any():
-        log(f"        Both rules give the same partition. Minimum dominance "
-            f"ratio among Core = {dominance_ratio[is_core].min():.3f} "
-            f"(>= 4 as expected)")
+        log(f"        The two rules give the identical split. "
+            f"Min dominance ratio among Core = {dominance_ratio[is_core].min():.3f} "
+            f"(>= 4 matches the theory)")
     elif n_diff:
-        log("[WARN] The two rules disagree; re-check the membership criterion.")
+        log("[WARN] The two rules disagree. Re-check manuscript 2.4.")
 
-    log(f"[RESULT] {len(species_names)} species total / "
-        f"Core Member {int(is_core.sum())} / Ambiguous {int((~is_core).sum())}")
+    log(f"[RESULT] total {len(species_names)} species / "
+        f"Core Member {int(is_core.sum())} / Distributed {int((~is_core).sum())}")
     per_arch = (pd.Series(top1_idx[is_core] + 1)
                 .value_counts()
                 .reindex(range(1, k_val + 1), fill_value=0)
                 .tolist())
-    log(f"       Core count per archetype 1..{k_val}: {per_arch}")
+    log(f"       Core per archetype 1..{k_val}: {per_arch}")
 
-    # --- Sheet 1: archetype signatures (top features of H) ------------------
+    # --- Sheet 1: archetype signatures (top H features) -------------------
     sig_rows = []
     for k in range(k_val):
         for rank, idx in enumerate(np.argsort(H[k])[::-1][:10], 1):
@@ -170,7 +165,7 @@ def generate_report(matrix, feature_names, species_names, k_val):
             })
     df_sig = pd.DataFrame(sig_rows)
 
-    # --- Sheet 2: membership and taxonomy -----------------------------------
+    # --- Sheet 2: membership and classification ---------------------------
     df_tax = get_taxonomy_info(species_names)
     df_tax["Primary_Cluster"] = top1_idx
     df_tax["Archetype"] = top1_idx + 1
@@ -185,7 +180,7 @@ def generate_report(matrix, feature_names, species_names, k_val):
     for i in range(k_val):
         df_tax[f"Weight_A{i + 1}"] = W[:, i]
 
-    # Sort by archetype, Core first, then descending dominance ratio
+    # Sort: archetype -> Core first -> Dominance Ratio descending
     df_tax["_order"] = np.where(df_tax["Membership_Status"] == "Core Member", 0, 1)
     df_tax = (df_tax
               .sort_values(by=["Archetype", "_order", "Dominance_Ratio"],
@@ -196,20 +191,20 @@ def generate_report(matrix, feature_names, species_names, k_val):
     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
         df_sig.to_excel(writer, sheet_name="1_Cluster_Signatures", index=False)
         df_tax.to_excel(writer, sheet_name="2_Species_Membership", index=False)
-    log(f"[OK] Report saved -> {out_xlsx}")
+    log(f"[OK] report saved -> {out_xlsx}")
 
-    # Membership CSV consumed by 04, 05, 07 and 08
+    # Membership CSV (nmf_membership.csv; fallback/reference for 08)
     df_tax.to_csv(NMF_MEMBERSHIP_PATH, index=False, encoding="utf-8-sig")
-    log(f"[OK] Membership CSV saved -> {NMF_MEMBERSHIP_PATH.name}")
+    log(f"[OK] membership CSV saved -> {NMF_MEMBERSHIP_PATH.name}")
 
 
 # ===========================================================================
-# Main
+# Run
 # ===========================================================================
 if __name__ == "__main__":
     matrix_norm, features, species = load_final_matrix(MATRIX_PATH)
 
-    # Command-line arguments override the default K
+    # K: CLI argument if given, else default K=6
     if len(sys.argv) > 1:
         target_ks = [int(v) for v in sys.argv[1:]]
     else:
