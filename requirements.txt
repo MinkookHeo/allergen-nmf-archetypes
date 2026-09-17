@@ -13,4 +13,4 @@ pypdf>=4.0          # A4 layout / page transforms for the figure PDFs
 reportlab>=4.0      # A4 canvas and author caption
 pymupdf>=1.24       # crop and A4 composition of the Figure 3 tree PDF
 
-# Standard library used: io, os, re, sys, time, difflib, shutil, sqlite3, pathlib
+# Standard library used: io, os, re, sys, time, shutil, sqlite3, pathlib
