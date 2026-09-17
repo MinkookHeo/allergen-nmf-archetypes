@@ -1,265 +1,211 @@
 # -*- coding: utf-8 -*-
 """
-08_figure2d_audit.py
+07_phylogeny_itol.py
 
-Verifies the aggregation behind the Figure 2D alluvial diagram.
+Builds the Core species list and the iTOL annotation files for Figure 3.
 
-Because the archetype weight matrix is row-normalized, the ribbons emanating
-from a taxonomic order must sum to the number of species assigned to that
-order. The script checks this identity and reports every source of loss.
+Outputs
+  (A) Core species scientific-name list  -> phyloT / NCBI Common Tree input
+  (B) iTOL multibar dataset (NMF archetype proportions) + leaf-label dataset
+  (C) DATASET_STYLE that renders leaf labels in italic
+  (D) A copy of the Newick tree for upload
 
-  [1] Per species: the row sum of Frac_A1..AK equals 1 (zero for empty rows).
-  [2] Per order:   the sum of ribbon widths equals the species count.
-  [3] Loss:        species without an Order, species with all-zero weights,
-                   and ribbons dropped by the display threshold.
-  [4] Contrast:    soft-weight aggregation against hard-label counting.
-  [5] Detail:      per-species archetype breakdown for one order.
-
-Input  : figure_source_data.csv (written by 03 and 04)
-         required columns - Display_Name, Order, Archetype, Weight_A1..Weight_A{K}
-Output : results/audit_fig2d_order_totals.csv
-         results/audit_fig2d_species_detail.csv
-         results/audit_fig2d_log.txt
-
-Usage  : python src/08_figure2d_audit.py             # detail for Rosales
-         python src/08_figure2d_audit.py Fagales     # detail for another order
+Two-pass workflow
+  Pass 1 (no tree yet): only the species list (A) is written; the tree must be
+          generated externally (phyloT / NCBI) from that list and saved as
+          data/phylogeny/phyliptree.phy.
+  Pass 2 (tree present): the iTOL datasets (B, C, D) are written.
 """
 
+import re
+import shutil
 import sys
-from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
+from config import (
+    FIGDIR, PHYLO_DIR,
+    K, ARCH_HEX,
+    BIOLOGICAL_MAP,
+    norm_name,
+)
+
 # ===========================================================================
-# 0. Settings (falls back to local defaults if config.py is unavailable)
+# 0. Paths
 # ===========================================================================
-# --- allow "from config import ..." when run from src/ -------------
-import sys as _sys
-from pathlib import Path as _Path
-_sys.path.append(str(_Path(__file__).resolve().parent.parent))
-# -------------------------------------------------------------------
-try:
-    from config import FIGDIR, RESULTS_DIR, K, NMF_MEMBERSHIP_PATH
-except Exception:
-    RESULTS_DIR = Path(".")
-    FIGDIR = Path(".")
-    K = 6
-    NMF_MEMBERSHIP_PATH = RESULTS_DIR / "nmf_membership.csv"
+IN_SOURCE = FIGDIR / "figure_source_data.csv"    # written by 04
+IN_TREE = PHYLO_DIR / "phyliptree.phy"
 
-# Must match the list used in draw_panel_D
-TARGET_ORDERS = [
-    "Poales", "Rosales", "Fagales", "Fabales", "Asterales",
-    "Malpighiales", "Lamiales", "Zingiberales",
-]
-RIBBON_MIN = 0.001          # display threshold used in 04
-TOL = 1e-6                  # floating-point tolerance
-
-IN_CANDIDATES = [
-    FIGDIR / "figure_source_data.csv",
-    NMF_MEMBERSHIP_PATH,
-    RESULTS_DIR / "nmf_membership.csv",
-]
-
-OUT_ORDER = RESULTS_DIR / "audit_fig2d_order_totals.csv"
-OUT_SPECIES = RESULTS_DIR / "audit_fig2d_species_detail.csv"
-OUT_LOG = RESULTS_DIR / "audit_fig2d_log.txt"
-
-_lines = []
-
-
-def log(msg=""):
-    print(msg)
-    _lines.append(str(msg))
+OUT_SPECIES_TXT = PHYLO_DIR / "core_species.txt"
+OUT_TREE_COPY = PHYLO_DIR / "iTOL_upload_tree.phy"
+OUT_MULTIBAR = PHYLO_DIR / "iTOL_multibar_dataset.txt"
+OUT_LABELS = PHYLO_DIR / "iTOL_label_dataset.txt"
+OUT_STYLE = PHYLO_DIR / "iTOL_label_style_dataset.txt"
 
 
 # ===========================================================================
-# 1. Load input
+# Helpers
 # ===========================================================================
-def load_source():
-    for p in IN_CANDIDATES:
-        if p.exists():
-            df = pd.read_csv(p)
-            log(f"[IN] {p}  ({len(df)} rows)")
-            return df
-    log("[ERROR] Input file not found. Candidates:")
-    for p in IN_CANDIDATES:
-        log(f"       - {p}")
-    sys.exit(1)
+def _norm(s):
+    """Normalize a tip/label for matching: unquote, underscores->spaces,
+    lowercase, collapse whitespace."""
+    s = str(s).strip().strip("'").replace("_", " ")
+    return " ".join(s.lower().split())
 
 
-df = load_source()
+def _binom(norm_s):
+    """First two tokens (genus species) of a normalized name."""
+    toks = norm_s.split()
+    return " ".join(toks[:2]) if len(toks) >= 2 else norm_s
 
-WCOLS = [f"Weight_A{i + 1}" for i in range(K)]
-missing = [c for c in ["Display_Name", "Order"] + WCOLS if c not in df.columns]
-if missing:
-    log(f"[ERROR] Missing required columns: {missing}")
-    log(f"        Columns present: {list(df.columns)}")
-    sys.exit(1)
 
-log(f"[OK] {len(df)} species / K={K}")
+def parse_tree_tips(tree_text):
+    """Return the tree tips as {normalized_full: token, normalized_binomial: token}.
 
-# ===========================================================================
-# 2. Archetype proportions (same procedure as draw_panel_D)
-# ===========================================================================
-w = df[WCOLS].to_numpy(dtype=float)
-row_sums = w.sum(axis=1, keepdims=True)
-zero_mask = (row_sums.ravel() == 0)
-row_sums[row_sums == 0] = 1.0
-fracs = w / row_sums
+    Handles both quoted labels ('Genus species ...') and unquoted labels
+    (Genus_species:...). The token is the exact string to reference from the
+    iTOL datasets.
+    """
+    by_full, by_binom = {}, {}
+    tokens = []
+    # quoted labels
+    for m in re.finditer(r"'([^']+)'", tree_text):
+        tokens.append((m.group(1), f"'{m.group(1)}'"))
+    # unquoted labels (name immediately followed by ':')
+    for m in re.finditer(r"[(,]\s*([A-Za-z_][^,():;']*?)\s*:", tree_text):
+        tokens.append((m.group(1), m.group(1)))
 
-FCOLS = [f"Frac_A{i + 1}" for i in range(K)]
-for i, c in enumerate(FCOLS):
-    df[c] = fracs[:, i]
+    for clean, token in tokens:
+        nf = _norm(clean)
+        by_full.setdefault(nf, token)
+        by_binom.setdefault(_binom(nf), token)
+    return by_full, by_binom
 
-df["Frac_rowsum"] = df[FCOLS].sum(axis=1)
-df["is_zero_row"] = zero_mask
-
-# ---- [1] Per-species row sums ---------------------------------------------
-log("\n" + "=" * 70)
-log("[1] Per species: row sum of proportions == 1")
-log("=" * 70)
-
-bad_rows = df[(~df["is_zero_row"]) & (np.abs(df["Frac_rowsum"] - 1.0) > TOL)]
-if len(bad_rows):
-    log(f"[FAIL] {len(bad_rows)} species whose row sum is not 1")
-    for _, r in bad_rows.iterrows():
-        log(f"       {r['Display_Name']}: {r['Frac_rowsum']:.6f}")
-else:
-    log(f"[PASS] all {int((~zero_mask).sum())} species with non-zero weights sum to 1")
-
-if zero_mask.any():
-    log(f"[NOTE] {int(zero_mask.sum())} species have all-zero archetype weights "
-        f"and contribute nothing to the diagram")
-    for nm in df.loc[zero_mask, "Display_Name"]:
-        log(f"       - {nm}")
-
-# ---- Species without an Order ---------------------------------------------
-n_no_order = int(df["Order"].isna().sum())
-if n_no_order:
-    log(f"\n[NOTE] {n_no_order} species have no Order and are excluded entirely")
-    for nm in df.loc[df["Order"].isna(), "Display_Name"]:
-        log(f"       - {nm}")
 
 # ===========================================================================
-# 3. Per-order aggregation check
+# 1. Core species list (scientific names for phyloT / NCBI)
 # ===========================================================================
-log("\n" + "=" * 70)
-log("[2] Per order: sum of ribbon widths == species count")
-log("=" * 70)
+def extract_core_species(df):
+    """Write the Core species scientific names, applying NCBI/phyloT synonyms."""
+    core = df[df["Membership_Status"] == "Core Member"]["key"].copy()
+    corrected = core.apply(lambda x: BIOLOGICAL_MAP.get(x.strip(), x.strip()))
+    corrected.to_csv(OUT_SPECIES_TXT, index=False, header=False)
+    print(f"[OK] Core {len(corrected)} species -> {OUT_SPECIES_TXT.name}")
+    return corrected
 
-rows = []
-for o in TARGET_ORDERS:
-    sub = df[df["Order"] == o]
-    n_sp = len(sub)
-    if n_sp == 0:
-        log(f"[WARN] {o}: no species in the dataset.")
-        continue
-
-    per_arch = sub[FCOLS].sum()                   # contribution per archetype
-    soft_total = float(per_arch.sum())            # should equal n_sp
-    drawn = float(per_arch[per_arch > RIBBON_MIN].sum())   # width actually drawn
-    dropped = soft_total - drawn
-    n_zero = int(sub["is_zero_row"].sum())
-    n_ribbon = int((per_arch > RIBBON_MIN).sum())
-
-    expected = n_sp - n_zero                      # all-zero species contribute 0
-    ok = abs(soft_total - expected) <= TOL * max(1, n_sp)
-
-    # Contrast with hard-label counting
-    hard = sub["Archetype"].value_counts().reindex(
-        range(1, K + 1), fill_value=0) if "Archetype" in sub.columns else None
-    n_arch_hard = int((hard > 0).sum()) if hard is not None else np.nan
-
-    rows.append({
-        "Order": o,
-        "n_species": n_sp,
-        "n_zero_weight_species": n_zero,
-        "expected_total": expected,
-        "soft_sum": round(soft_total, 6),
-        "drawn_sum": round(drawn, 6),
-        "dropped_by_threshold": round(dropped, 6),
-        "n_ribbons_drawn": n_ribbon,
-        "n_archetypes_hard_label": n_arch_hard,
-        "check": "PASS" if ok else "FAIL",
-    })
-
-    flag = "PASS" if ok else "FAIL"
-    log(f"  {o:<14} n {n_sp:>3} | sum {soft_total:8.4f} "
-        f"| expected {expected:>3} | drawn {drawn:8.4f} "
-        f"| dropped {dropped:.4f} | ribbons {n_ribbon}/{K} "
-        f"| hard {n_arch_hard} | {flag}")
-
-order_df = pd.DataFrame(rows)
-order_df.to_csv(OUT_ORDER, index=False, encoding="utf-8-sig")
-
-n_fail = int((order_df["check"] == "FAIL").sum())
-tot_dropped = float(order_df["dropped_by_threshold"].sum())
-
-log("")
-if n_fail:
-    log(f"[FAIL] {n_fail} orders disagree with their species-level totals.")
-else:
-    log("[PASS] every displayed order satisfies sum(ribbons) = species count")
-
-log(f"[3] Display threshold RIBBON_MIN={RIBBON_MIN} dropped a total "
-    f"contribution of {tot_dropped:.6f} (equivalent to {tot_dropped:.4f} species)")
-if tot_dropped > 0:
-    log("    -> state in the legend that ribbons below 0.1% are not drawn")
-
-# ---- Soft weights vs hard labels ------------------------------------------
-log("\n" + "=" * 70)
-log("[4] Soft-weight aggregation vs hard-label counting")
-log("=" * 70)
-if "Archetype" in df.columns:
-    for o in order_df["Order"]:
-        sub = df[df["Order"] == o]
-        soft = sub[FCOLS].sum().round(3).tolist()
-        hard = sub["Archetype"].value_counts().reindex(
-            range(1, K + 1), fill_value=0).tolist()
-        log(f"  {o:<14} soft {soft}")
-        log(f"  {'':<14} hard {hard}")
-else:
-    log("  Column 'Archetype' is absent; skipping the contrast.")
 
 # ===========================================================================
-# 4. Per-species breakdown for one order
+# 2. iTOL files (multibar + label + style)
 # ===========================================================================
-focus = sys.argv[1] if len(sys.argv) > 1 else "Rosales"
+def generate_itol_files(df):
+    """Generate the iTOL multibar, label and style datasets."""
+    shutil.copy(IN_TREE, OUT_TREE_COPY)
+    tree_text = IN_TREE.read_text(encoding="utf-8", errors="ignore")
+    by_full, by_binom = parse_tree_tips(tree_text)
 
-log("\n" + "=" * 70)
-log(f"[5] {focus}: per-species archetype breakdown")
-log("=" * 70)
+    # multibar header
+    bar_lines = [
+        "DATASET_MULTIBAR",
+        "SEPARATOR COMMA",
+        "DATASET_LABEL,NMF_Archetype_Composition",
+        "COLOR,#000000",
+        f"FIELD_COLORS,{','.join(ARCH_HEX)}",
+        ("FIELD_LABELS,Archetype 1 (PR-10),Archetype 2 (Parvalbumin),"
+         "Archetype 3 (nsLTP1),Archetype 4 (Profilin),"
+         "Archetype 5 (Tropomyosin),Archetype 6 (Seed storage)"),
+        "LEGEND_TITLE,Allergenic archetypes",
+        "LEGEND_SHAPES,1,1,1,1,1,1",
+        f"LEGEND_COLORS,{','.join(ARCH_HEX)}",
+        ("LEGEND_LABELS,Archetype 1 (PR-10),Archetype 2 (Parvalbumin),"
+         "Archetype 3 (nsLTP1),Archetype 4 (Profilin),"
+         "Archetype 5 (Tropomyosin),Archetype 6 (Seed storage)"),
+        "ALIGN_FIELDS,1",
+        "WIDTH,100",
+        "MARGIN,5",
+        "DATA",
+    ]
 
-sub = df[df["Order"] == focus].copy()
-if len(sub) == 0:
-    log(f"  No species found for {focus}.")
-else:
-    sub = sub.sort_values("Display_Name")
-    cols = ["Display_Name"] + FCOLS + ["Frac_rowsum"]
-    if "Archetype" in sub.columns:
-        cols.insert(1, "Archetype")
-    if "Membership_Status" in sub.columns:
-        cols.insert(1, "Membership_Status")
+    label_lines = ["LABELS", "SEPARATOR TAB", "DATA"]
 
-    detail = sub[cols].copy()
-    detail[FCOLS] = detail[FCOLS].round(4)
-    detail.to_csv(OUT_SPECIES, index=False, encoding="utf-8-sig")
+    # Whole leaf label rendered in italic.
+    style_lines = [
+        "DATASET_STYLE",
+        "SEPARATOR TAB",
+        "DATASET_LABEL\tLeaf label style (italic)",
+        "COLOR\t#000000",
+        "DATA",
+    ]
 
-    with pd.option_context("display.width", 200,
-                           "display.max_columns", 50):
-        log(detail.to_string(index=False))
+    # archetype proportions
+    wc = [f"Weight_A{i+1}" for i in range(K)]
+    w_vals = df[wc].to_numpy(dtype=float)
+    row_sums = w_vals.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    fracs = w_vals / row_sums
 
-    log(f"\n  {focus} species count : {len(sub)}")
-    log(f"  total proportion    : {sub[FCOLS].to_numpy().sum():.6f}")
-    log(f"  sum per archetype   : "
-        f"{dict(zip(range(1, K + 1), sub[FCOLS].sum().round(4).tolist()))}")
-    log(f"  -> these must match the {focus} ribbon widths in Figure 2D")
-    log(f"  [OK] per-species detail -> {OUT_SPECIES}")
+    missing = []
+    for idx, row in df.iterrows():
+        if row.get("Membership_Status") != "Core Member":
+            continue
+
+        key_name = str(row["key"]).strip()
+        target_name = BIOLOGICAL_MAP.get(key_name, key_name)
+
+        # Match against the tree by exact binomial, then genus+species.
+        nt = _norm(target_name)
+        node = by_full.get(nt) or by_binom.get(_binom(nt))
+        if node is None:
+            missing.append(f"{key_name} -> {target_name}")
+            continue
+
+        f_vals = [f"{fracs[idx, i]:.4f}" for i in range(K)]
+        bar_lines.append(f"{node},{','.join(f_vals)}")
+
+        # Leaf label: 'Genus species (common name)' on one line.
+        disp = str(row.get("Display_Name", key_name)).strip()
+        display_label = disp if disp else key_name
+
+        label_lines.append(f"{node}\t{display_label}")
+        style_lines.append(f"{node}\tlabel\tnode\t#000000\t1\titalic")
+
+    OUT_MULTIBAR.write_text("\n".join(bar_lines), encoding="utf-8", newline="\n")
+    OUT_LABELS.write_text("\n".join(label_lines), encoding="utf-8", newline="\n")
+    OUT_STYLE.write_text("\n".join(style_lines), encoding="utf-8", newline="\n")
+
+    print(f"[OK] iTOL multibar    -> {OUT_MULTIBAR.name}")
+    print(f"[OK] iTOL labels      -> {OUT_LABELS.name}")
+    print(f"[OK] iTOL label style -> {OUT_STYLE.name}")
+    print(f"[OK] tree copy        -> {OUT_TREE_COPY.name}")
+
+    if missing:
+        print(f"\n[WARN] {len(missing)} Core species not found in the tree "
+              f"(no dataset row written for them):")
+        for m in missing:
+            print(f"       - {m}")
+        print("       -> add these tips to the tree (regenerate from "
+              f"{OUT_SPECIES_TXT.name}) and re-run.")
+
 
 # ===========================================================================
-# 5. Save
+# Run
 # ===========================================================================
-OUT_LOG.write_text("\n".join(_lines), encoding="utf-8")
-log(f"\n[OK] order summary -> {OUT_ORDER}")
-log(f"[OK] log           -> {OUT_LOG}")
+if __name__ == "__main__":
+    if not IN_SOURCE.exists():
+        print(f"[ERROR] source data not found: {IN_SOURCE}")
+        print("        Run 04_figure_generation.py first.")
+        sys.exit(1)
+
+    df = pd.read_csv(IN_SOURCE)
+    print(f"[OK] source loaded: {len(df)} species")
+
+    extract_core_species(df)
+
+    if not IN_TREE.exists():
+        print(f"\n[STOP] Newick tree not found: {IN_TREE}")
+        print(f"       Pass 1 complete: generate the tree from "
+              f"{OUT_SPECIES_TXT.name} (phyloT / NCBI Common Tree), save it as")
+        print(f"       {IN_TREE}, then re-run this script to build the iTOL files.")
+        sys.exit(0)
+
+    generate_itol_files(df)
+    print("\n[DONE] phylogeny files complete.")
