@@ -2,24 +2,20 @@
 """
 04_figure_generation.py
 
-Loads the factorization saved by 03 and builds Figure 2, then applies the A4
-post-processing step to the Figure 3 phylogenetic tree PDF exported from iTOL.
+Loads the NMF results (W/H saved by 03) and generates all Figure 2 panels.
+Also performs the A4 post-processing (margin crop + composition) of the
+Figure 3 tree PDF.
 
 Figure 2 panels
-  (A) Top-10 bar plots (taxonomic order / family / conserved protein family)
-  (B) Dominance landscape, Core vs Ambiguous
-  (C) Archetype composition of regulated allergens (stacked bars)
-  (D) Alluvial diagram, taxonomic order vs archetype
-
-Panel D aggregates the continuous archetype weights rather than a single
-primary label, so species with mixed repertoires contribute to every archetype
-they load onto. 08_figure2d_audit.py verifies this aggregation.
+  (A) Top-10 barplot x 3 (Order / Family / Protein family)
+  (B) Core vs Distributed scatter (dominance landscape)
+  (C) Regulated-allergen composition (stacked bar)
+  (D) Alluvial diagram (soft-clustering)
 """
 
 import io
 import os
 import sqlite3
-from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
@@ -36,47 +32,42 @@ from pypdf import PdfReader, PdfWriter, Transformation
 from reportlab.pdfgen import canvas
 from reportlab.lib.colors import white, black
 
-# --- allow "from config import ..." when run from src/ -------------
-import sys as _sys
-from pathlib import Path as _Path
-_sys.path.append(str(_Path(__file__).resolve().parent.parent))
-# -------------------------------------------------------------------
 from config import (
     DB_PATH, MATRIX_PATH, RESULTS_DIR, FIGDIR, A4DIR, PHYLO_DIR,
-    NMF_W_PATH, NMF_H_PATH,
+    NMF_W_PATH,
     K, RANDOM_STATE, CORE_RA_THRESHOLD,
-    ARCH_HEX, ARCH_RGBA, CORE_COLOR, AMB_COLOR,
+    ARCH_HEX, ARCH_RGBA, CORE_COLOR, DIST_COLOR,
     TAXONOMY_CORRECTIONS, MANUAL_ORDERS,
     cap_first, norm_name, set_journal_font,
 )
 
 # ===========================================================================
-# 0. Fonts
+# 0. Font setup
 # ===========================================================================
 set_journal_font()
 
 # ===========================================================================
-# 1. Data pipeline
+# 1. Data pipeline (loads NMF results)
 # ===========================================================================
 def prepare_data():
     raw = pd.read_csv(MATRIX_PATH, index_col=0)
 
-    # Reuse the W matrix saved by 03 instead of refitting
+    # Load W saved by 03 instead of recomputing NMF.
     if NMF_W_PATH.exists():
         W = np.load(NMF_W_PATH)
-        print(f"[OK] W loaded: {NMF_W_PATH.name}  shape={W.shape}")
+        print(f"[OK] NMF W loaded: {NMF_W_PATH.name}  shape={W.shape}")
     else:
         from sklearn.decomposition import NMF as _NMF
-        print("[WARN] W.npy not found -> refitting NMF (run 03 first)")
+        print("[WARN] W.npy missing -> recomputing NMF (run 03 first)")
         matrix_norm = Normalizer(norm="l1").fit_transform(np.log1p(raw))
         model = _NMF(n_components=K, init="nndsvda",
-                      max_iter=5000, random_state=RANDOM_STATE)
+                     max_iter=5000, random_state=RANDOM_STATE)
         W = model.fit_transform(matrix_norm)
 
     order_idx = np.argsort(W, axis=1)[:, ::-1]
     top1_idx, top2_idx = order_idx[:, 0], order_idx[:, 1]
-    top1_w = np.take_along_axis(W, top1_idx[:, None], axis=1).squeeze()
-    top2_w = np.take_along_axis(W, top2_idx[:, None], axis=1).squeeze()
+    top1_w = np.take_along_axis(W, top1_idx[:, None], axis=1).ravel()
+    top2_w = np.take_along_axis(W, top2_idx[:, None], axis=1).ravel()
 
     eps = 1e-9
     dominance_ratio = top1_w / (top2_w + eps)
@@ -84,7 +75,7 @@ def prepare_data():
     relative_abundance = top1_w / np.where(row_sum == 0, 1, row_sum)
 
     is_core = relative_abundance >= CORE_RA_THRESHOLD
-    status = np.where(is_core, "Core Member", "Ambiguous")
+    status = np.where(is_core, "Core Member", "Distributed")
 
     df_nmf = pd.DataFrame({
         "Display_Name": raw.index,
@@ -115,19 +106,19 @@ def prepare_data():
 
     df_nmf["key"] = df_nmf["Display_Name"].apply(norm_name)
 
-    # Separate key for the taxonomy lookup; "key" stays as written for 07
+    # taxonomy-only key (the "key" column used by 07 is left as-is)
     df_nmf["tax_key"] = df_nmf["key"].replace(TAXONOMY_CORRECTIONS)
     df_nmf["Order"] = df_nmf["tax_key"].map(map_order)
     df_nmf["Family"] = df_nmf["tax_key"].map(map_family)
 
-    # Species the database cannot resolve fall back to the manual table
+    # Fill species unresolved by the DB with the manual overrides.
     n_before = int(df_nmf["Order"].isna().sum())
     df_nmf["Order"] = df_nmf["Order"].fillna(df_nmf["tax_key"].map(MANUAL_ORDERS))
     n_manual = n_before - int(df_nmf["Order"].isna().sum())
     if n_manual:
-        print(f"[TAX] Orders supplied from MANUAL_ORDERS: {n_manual}")
+        print(f"[TAX] filled by MANUAL_ORDERS: {n_manual}")
     n_miss = int(df_nmf["Order"].isna().sum())
-    print(f"[TAX] {n_miss} species without an Order match")
+    print(f"[TAX] {n_miss} species without Order")
     for nm in df_nmf.loc[df_nmf["Order"].isna(), "Display_Name"]:
         print(f"      unmatched: {nm}")
 
@@ -159,7 +150,7 @@ def prepare_data():
 
 
 # ===========================================================================
-# 2. Panel drawing
+# 2. Individual panels
 # ===========================================================================
 def draw_panel_A(axes, top_order, top_family, top_protfam, is_individual=False):
     sns.barplot(x=top_order.values, y=top_order.index,
@@ -194,7 +185,7 @@ def draw_panel_B(ax, df_nmf, is_individual=False):
     sns.scatterplot(
         data=df_nmf, x="Relative_Abundance", y="Dominance_Ratio",
         hue="Membership_Status",
-        palette={"Core Member": CORE_COLOR, "Ambiguous": AMB_COLOR},
+        palette={"Core Member": CORE_COLOR, "Distributed": DIST_COLOR},
         alpha=0.75, edgecolor="k", s=60, ax=ax)
     ax.axvline(0.80, color="gray", ls="--", lw=1.5, zorder=0)
     ax.set_yscale("log")
@@ -204,8 +195,8 @@ def draw_panel_B(ax, df_nmf, is_individual=False):
 
     ax.text(0.58, 10**7.5, "Core\n(single-family dominant)",
             color=CORE_COLOR, fontsize=11, ha="center", va="center")
-    ax.text(0.35, 10**3, "Ambiguous\n(multi-family)",
-            color=AMB_COLOR, fontsize=11, ha="center", va="bottom")
+    ax.text(0.35, 10**3, "Distributed\n(multi-family)",
+            color=DIST_COLOR, fontsize=11, ha="center", va="bottom")
     ax.spines[["top", "right"]].set_visible(False)
 
     if is_individual:
@@ -217,7 +208,7 @@ def draw_panel_B(ax, df_nmf, is_individual=False):
 
 def draw_panel_C(ax, df_nmf, is_individual=False):
     REGULATED_REPS = [
-        ("Anacardium occidentale",       "Cashew"),
+        ("Anacardium occidentale",      "Cashew"),
         ("Sesamum indicum",             "Sesame"),
         ("Brassica juncea",             "Brown mustard"),
         ("Litopenaeus vannamei",        "Pacific white shrimp"),
@@ -378,7 +369,7 @@ def draw_panel_D(ax, df_nmf, is_individual=False):
 
 
 # ===========================================================================
-# 3. Plotly HTML Alluvial
+# 3. Plotly HTML alluvial
 # ===========================================================================
 def create_figure_2c_alluvial_html(df):
     target_orders = [
@@ -493,17 +484,22 @@ def create_figure_2_combined(df_nmf, top_order, top_family, top_protfam):
     draw_panel_D(axes[1, 2], df_nmf, is_individual=False)
 
     plt.tight_layout()
+
     out_pdf = FIGDIR / "Figure_2_raw.pdf"
+    out_png = FIGDIR / "Figure_2_raw.png"
+
     plt.savefig(out_pdf, bbox_inches="tight", pad_inches=0.25)
+    plt.savefig(out_png, bbox_inches="tight", pad_inches=0.25, dpi=300)
+
     plt.close()
     return out_pdf
 
 
 # ===========================================================================
-# 5. A4 portrait composition (pypdf + reportlab)
+# 5. A4 layout for the panels (pypdf + reportlab)
 # ===========================================================================
 def apply_a4_formatting(pdf_tasks):
-    """Place each Figure 2 panel on an A4 portrait page."""
+    """Compose the Figure 2 panels onto A4 pages (pypdf + reportlab)."""
     MM = 72.0 / 25.4
     A4_W, A4_H = 210 * MM, 297 * MM
     margin = 15 * MM
@@ -559,14 +555,14 @@ def apply_a4_formatting(pdf_tasks):
 
 
 # ===========================================================================
-# 6. Figure 3 post-processing
+# 6. Figure 3 A4 post-processing
 # ===========================================================================
 def format_figure3_a4():
-    """Crop the whitespace around the Figure 3 tree and compose it on A4."""
+    """Crop margins of the Figure 3 tree PDF and compose it onto A4 (pymupdf)."""
     try:
         import pymupdf
     except ImportError:
-        print("[WARN] pymupdf not installed -> skipping Figure 3 post-processing")
+        print("[WARN] pymupdf not installed -> skipping Figure 3 A4 step")
         return
 
     input_pdf = PHYLO_DIR / "Figure_3.pdf"
@@ -579,7 +575,7 @@ def format_figure3_a4():
     MARGIN = 15 * MM
     LEGEND_SPACE = 45 * MM
 
-    # Step 1. Crop whitespace
+    # STEP 1. crop margins
     doc = pymupdf.open(input_pdf)
     page = doc[0]
 
@@ -590,7 +586,7 @@ def format_figure3_a4():
         rects.append(drawing["rect"])
 
     if not rects:
-        print("[WARN] Could not detect the content area of Figure 3")
+        print("[WARN] Figure 3 content region not detected")
         doc.close()
         return
 
@@ -608,7 +604,7 @@ def format_figure3_a4():
     doc.save(cropped_path)
     doc.close()
 
-    # Step 2. Compose on A4
+    # STEP 2. compose onto A4
     cropped_doc = pymupdf.open(cropped_path)
     src_page = cropped_doc[0]
     crop_box = src_page.cropbox
@@ -647,13 +643,13 @@ def format_figure3_a4():
 
 
 # ===========================================================================
-# Main
+# Run
 # ===========================================================================
 if __name__ == "__main__":
-    print("1. Loading the factorization and preparing data...")
+    print("1. Load NMF results + prepare data...")
     df_nmf, top_order, top_family, top_protfam = prepare_data()
 
-    print("2. Building individual panels...")
+    print("2. Individual panels...")
     fig2a_pdf = create_figure_2a_independent(top_order, top_family, top_protfam)
     fig2b_pdf = create_figure_2b_independent(df_nmf)
     fig2c_pdf = create_figure_2c_independent(df_nmf)
@@ -661,10 +657,10 @@ if __name__ == "__main__":
     fig2c_html = create_figure_2c_alluvial_html(df_nmf)
     print(f"   [HTML] {fig2c_html.name}")
 
-    print("3. Assembling Figure 2...")
+    print("3. Combined 2x3 Figure 2...")
     fig2_pdf = create_figure_2_combined(df_nmf, top_order, top_family, top_protfam)
 
-    print("4. Applying A4 layout to Figure 2...")
+    print("4. Figure 2 A4 layout...")
     pdf_tasks = [
         (fig2a_pdf, "Figure 2(a)"),
         (fig2b_pdf, "Figure 2(b)"),
@@ -674,7 +670,7 @@ if __name__ == "__main__":
     ]
     apply_a4_formatting(pdf_tasks)
 
-    print("5. Post-processing Figure 3...")
+    print("5. Figure 3 A4 post-processing...")
     format_figure3_a4()
 
-    print("\n[DONE] Figure 2 and Figure 3 written.")
+    print("\n[DONE] Figure 2 + Figure 3 A4 complete.")
