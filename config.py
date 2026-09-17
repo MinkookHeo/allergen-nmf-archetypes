@@ -29,10 +29,13 @@ CACHE_DIR = RESULTS_DIR / "consensus_cache"
 DB_PATH = DATA_DIR / "allergen_database.sqlite"
 MATRIX_PATH = DATA_DIR / "allergen_source_matrix.csv"
 
-# NMF artefacts produced by 03, consumed by 04, 05, 07 and 08
+# NMF artefacts produced by 03, consumed by 04/05 (.npy) and 07/08 (CSV).
+# NMF_MEMBERSHIP_PATH is kept distinct from the figure_source_data.csv that
+# 04 writes: the two files have different column schemas, so a shared name
+# would overwrite one depending on run order.
 NMF_W_PATH = RESULTS_DIR / "nmf_W.npy"
 NMF_H_PATH = RESULTS_DIR / "nmf_H.npy"
-NMF_MEMBERSHIP_PATH = RESULTS_DIR / "figure_source_data.csv"
+NMF_MEMBERSHIP_PATH = RESULTS_DIR / "nmf_membership.csv"
 
 # Create output directories
 for _d in [DATA_DIR, RESULTS_DIR, A4DIR, PHYLO_DIR, CACHE_DIR]:
@@ -57,7 +60,7 @@ ARCH_RGBA = [
     'rgba(230,159,0,0.5)', 'rgba(0,158,115,0.5)', 'rgba(240,228,66,0.5)',
 ]
 CORE_COLOR = '#D55E00'
-AMB_COLOR = '#0072B2'
+DIST_COLOR = '#0072B2'          # Distributed species
 
 # ============================================================================
 # 4. Taxonomic synonym maps
@@ -80,7 +83,7 @@ BIOLOGICAL_MAP = {
     "Triticum turgidum ssp durum": "Triticum turgidum subsp. durum",
 }
 
-# phyloT accepts NCBI TaxIDs for a few tips that resolve ambiguously by name
+# phyloT accepts NCBI TaxIDs for a few tips that resolve ambiguously by name.
 PHYLOT_CORRECTIONS = {
     **BIOLOGICAL_MAP,
     "Gadus callarias": "8053",
@@ -121,7 +124,7 @@ def norm_name(s):
 
 
 def set_journal_font():
-    """Set matplotlib font to Arial / Helvetica (Allergy journal guideline)."""
+    """Journal font setup (Arial preferred)."""
     preferred = ["Arial", "Helvetica", "Liberation Sans", "DejaVu Sans"]
     available = {f.name for f in fm.fontManager.ttflist}
     for name in preferred:
@@ -143,8 +146,7 @@ def set_journal_font():
 # 6. Logging helper
 # ============================================================================
 class Logger:
-    """Print to console and accumulate lines for a run log."""
-
+    """Simple console + file logger."""
     def __init__(self):
         self._lines = []
 
