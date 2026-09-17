@@ -2,11 +2,11 @@
 """
 01_data_preprocessing.py
 
-Builds the species-by-domain feature matrix.
+Species-by-domain bitscore matrix builder.
 
 Assembles allergen-homolog relationships from the SQLite database, removes
-non-food source organisms by exact genus match, and writes the final bitscore
-matrix (species x conserved-domain feature) to CSV.
+non-food species by genus, and writes the final bitscore matrix
+(species x protein family) to CSV.
 """
 
 import sqlite3
@@ -14,14 +14,9 @@ import sys
 
 import pandas as pd
 
-# --- allow "from config import ..." when run from src/ -------------
-import sys as _sys
-from pathlib import Path as _Path
-_sys.path.append(str(_Path(__file__).resolve().parent.parent))
-# -------------------------------------------------------------------
 from config import (
     DB_PATH, MATRIX_PATH, RESULTS_DIR,
-    N_REFERENCE_ALLERGENS, norm_name, Logger,
+    N_REFERENCE_ALLERGENS, Logger,
 )
 
 # ===========================================================================
@@ -69,10 +64,10 @@ try:
     with sqlite3.connect(DB_PATH) as conn:
         merged = pd.read_sql_query(QUERY, conn)
 except Exception as e:
-    log(f"[ERROR] Failed to load data: {e}")
+    log(f"[ERROR] Data load failed: {e}")
     sys.exit(1)
 
-log(f"[OK] Relationships assembled ({len(merged):,} rows)")
+log(f"[OK] Relationships assembled (rows: {len(merged):,})")
 
 # ===========================================================================
 # 2. Helpers
@@ -95,23 +90,23 @@ def collect_stats(df):
 def report(stats, label):
     log(f"\n--- [{label}] " + "-" * max(4, 46 - len(label)))
     log(f"  allergen-homolog pairs (rows) : {stats['pairs']:,}")
-    log(f"  unique homolog               : {stats['homologs']:,}")
-    log(f"  unique reference allergens    : {stats['allergens']:,}"
-        f"  / {N_REFERENCE_ALLERGENS:,} queried")
-    log(f"  GenBank accessions recovered  : {stats['accessions']:,}")
-    log(f"  source species               : {stats['species']:,}")
-    log(f"  conserved-domain feature     : {stats['features']:,}")
+    log(f"  unique homolog                : {stats['homologs']:,}")
+    log(f"  reference allergen (unique)   : {stats['allergens']:,}"
+        f"  / queried {N_REFERENCE_ALLERGENS:,}")
+    log(f"  GenBank accession (recovered) : {stats['accessions']:,}")
+    log(f"  source species                : {stats['species']:,}")
+    log(f"  conserved-domain feature      : {stats['features']:,}")
 
 
 pre_stats = collect_stats(merged)
-report(pre_stats, "before filtering")
+report(pre_stats, "before filter")
 
 if pre_stats["allergens"] > N_REFERENCE_ALLERGENS:
-    log(f"[WARN] Unique allergen count ({pre_stats['allergens']:,}) exceeds the "
-        f"number queried ({N_REFERENCE_ALLERGENS:,}).")
+    log(f"[WARN] unique allergens ({pre_stats['allergens']:,}) exceed the "
+        f"queried count ({N_REFERENCE_ALLERGENS:,}).")
 
 # ===========================================================================
-# 3. Remove non-food source organisms (exact genus match)
+# 3. Remove non-food species (exact genus match)
 # ===========================================================================
 GENERA_TO_REMOVE = {
     "Apis", "Vespa", "Vespula", "Bombus", "Polistes", "Polybia", "Solenopsis",
@@ -153,19 +148,19 @@ log(f"\n[FILTER] species {n_species_before} -> {n_species_after} "
 
 unmatched = sorted(GENERA_TO_REMOVE - set(removed_genera))
 if unmatched:
-    log(f"[WARN] {len(unmatched)} genera in the removal list were not found: {unmatched}")
+    log(f"[WARN] {len(unmatched)} genera not found in the DB: {unmatched}")
 
 pd.DataFrame({
     "removed_species": removed_species,
     "genus": [s.split()[0] if s else "" for s in removed_species],
 }).to_csv(OUT_REMOVED, index=False, encoding="utf-8-sig")
-log(f"[OK] Removed species list -> {OUT_REMOVED}")
+log(f"[OK] removed-species list -> {OUT_REMOVED}")
 
 post_stats = collect_stats(merged)
-report(post_stats, "after filtering")
+report(post_stats, "after filter")
 
 # ===========================================================================
-# 4. Display names and composite feature keys
+# 4. Display name / composite key
 # ===========================================================================
 has_common = merged["common_name"].notna() & (
     merged["common_name"].astype(str).str.strip() != ""
@@ -179,7 +174,7 @@ merged["Short_name"] = merged["Short_name"].fillna("Unknown")
 merged["Composite_ID"] = merged["Superfamily"] + "|" + merged["Short_name"]
 
 # ===========================================================================
-# 5. Build the matrix
+# 5. Build matrix
 # ===========================================================================
 matrix = (
     merged.groupby(["Display_Name", "Composite_ID"])["Bitscore"]
@@ -190,14 +185,14 @@ matrix = (
 matrix.to_csv(OUT_MATRIX, encoding="utf-8-sig")
 
 log("\n" + "=" * 62)
-log(f"[DONE] Final matrix: {matrix.shape[0]} species x {matrix.shape[1]} protein families")
-log(f"       saved to {OUT_MATRIX}")
+log(f"[DONE] final matrix: {matrix.shape[0]} (species) x {matrix.shape[1]} (families)")
+log(f"       saved -> {OUT_MATRIX}")
 log("=" * 62)
 
 # ===========================================================================
-# 6. Compare species composition against the previous NMF run
+# 6. Compare species set against a previous NMF result
 # ===========================================================================
-log("\n[COMPARE] species composition vs previous NMF output")
+log("\n[COMPARE] species composition vs previous NMF result")
 if not PREV_NMF_XLSX.exists():
     log(f"  skipped - file not found: {PREV_NMF_XLSX}")
 else:
@@ -212,7 +207,7 @@ else:
         log(f"  > newly included ({len(added)}):")
         for s in added:
             log(f"      + {s}")
-        log(f"  > dropped ({len(dropped)}):")
+        log(f"  > removed ({len(dropped)}):")
         for s in dropped:
             log(f"      - {s}")
         if not added and not dropped:
@@ -221,25 +216,25 @@ else:
         log(f"  [WARN] comparison failed: {e}")
 
 # ===========================================================================
-# 7. Summary for the Methods section
+# 7. Numbers for the manuscript Methods
 # ===========================================================================
 pct = post_stats["allergens"] / N_REFERENCE_ALLERGENS * 100
 
-log("\n[Values reported in Methods]")
+log("\n[Numbers for Methods]")
 log(f"  reference allergens queried              : {N_REFERENCE_ALLERGENS:,}")
-log(f"  reference allergens with >=1 hit (pre)    : {pre_stats['allergens']:,}")
-log(f"  reference allergens retained (post)       : {post_stats['allergens']:,} "
+log(f"  reference allergens with >=1 hit (before): {pre_stats['allergens']:,}")
+log(f"  reference allergens retained (after)     : {post_stats['allergens']:,} "
     f"({pct:.1f}%)")
-log(f"  GenBank accessions recovered (pre -> post): "
+log(f"  GenBank accessions recovered (before->after): "
     f"{pre_stats['accessions']:,} -> {post_stats['accessions']:,}")
-log(f"  allergen-homolog relationships (pre->post): "
+log(f"  allergen-homolog relationships (before->after): "
     f"{pre_stats['pairs']:,} -> {post_stats['pairs']:,}")
-log(f"  unique cross-reactive homologs (pre->post): "
+log(f"  unique cross-reactive homologs (before->after): "
     f"{pre_stats['homologs']:,} -> {post_stats['homologs']:,}")
-log(f"  source species (pre -> post)              : "
+log(f"  source species (before->after)           : "
     f"{pre_stats['species']:,} -> {post_stats['species']:,}")
-log(f"  conserved-domain features (pre -> post)   : "
+log(f"  conserved-domain features (before->after): "
     f"{pre_stats['features']:,} -> {post_stats['features']:,}")
 
 log.save(OUT_SUMMARY)
-print(f"\n[OK] Run log -> {OUT_SUMMARY}")
+print(f"\n[OK] run log -> {OUT_SUMMARY}")
