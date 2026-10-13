@@ -228,7 +228,7 @@ def draw_panel_C(ax, df_nmf, is_individual=False):
         w = r[wc].to_numpy(dtype=float)
         frac = w / w.sum()
         dr = r["Dominance_Ratio"]
-        dr_str = "> 10^3" if dr > 1000 else f"{dr:.1f}"
+        dr_str = "> 10\u00b3" if dr > 1000 else f"{dr:.1f}"
         rows_b.append((label, frac, dr_str, float(frac.max())))
 
     rows_b.sort(key=lambda x: x[3])
