@@ -9,6 +9,7 @@ Sections:
   [2] BIAS        test whether repertoire entropy is an annotation artifact
   [3] RAREFACTION entropy rank stability after equalizing sequencing depth
   [4] AMI         archetype vs taxonomy agreement with a permutation null
+  [5] FACET       unifaceted/multifaceted (superfamily breadth) vs Core/Distributed
 """
 
 import sqlite3
@@ -164,10 +165,13 @@ def species_annotation_profile():
     rel["key"] = rel["Source_Species"].apply(norm_name)
     rel["Composite"] = (rel["Superfamily"].fillna("-") + "|"
                         + rel["Short_name"].fillna("Unknown"))
+    rel["SF"] = rel["Superfamily"].fillna("-")
     rel["Bitscore"] = pd.to_numeric(rel["Bitscore"], errors="coerce").fillna(0)
 
+    # Each reference allergen is represented by the domain of its best hit.
     best = (rel.sort_values("Bitscore", ascending=False)
-               .drop_duplicates("Allergen_UID")[["Allergen_UID", "key", "Composite"]])
+               .drop_duplicates("Allergen_UID")
+               [["Allergen_UID", "key", "Composite", "SF"]])
 
     prof = best.groupby("key").agg(
         N_Allergens=("Allergen_UID", "nunique"),
@@ -175,6 +179,13 @@ def species_annotation_profile():
     )
     prof["Per_Family"] = prof["N_Allergens"] / prof["N_Families"].clip(lower=1)
     prof["N_Homologs"] = rel.groupby("key")["Similar_Protein"].nunique()
+
+    # Repertoire breadth for [5] FACET, counted at CDD-superfamily level so
+    # that one protein family split across CDD models (e.g. Profilin / PROF)
+    # is not double-counted. Unassigned superfamilies ("-") are ignored.
+    prof["N_Superfamilies"] = (best[best["SF"] != "-"]
+                               .groupby("key")["SF"].nunique())
+    prof["N_Superfamilies"] = prof["N_Superfamilies"].fillna(0).astype(int)
     return prof
 
 
@@ -431,6 +442,77 @@ def main():
     else:
         log("  -> Indistinguishable from chance; describe as independent of "
             "phylogeny.")
+
+    # ================================================================
+    # [5] FACET
+    # ================================================================
+    log("\n" + "=" * 68)
+    log("[5] FACET  unifaceted/multifaceted vs Core/Distributed")
+    log("=" * 68)
+    log("  definition: number of distinct CDD superfamilies represented by")
+    log("  the species' WHO/IUIS reference allergens (best-hit domain each)")
+    log("  Unifaceted = 1, Multifaceted >= 2, Unassigned = 0 or unmatched")
+
+    nsf = df["N_Superfamilies"]
+    df["Facet"] = np.select(
+        [nsf >= 2, nsf == 1],
+        ["Multifaceted", "Unifaceted"],
+        default="Unassigned")
+
+    log("\n  -- distribution of superfamily counts --")
+    log("  " + nsf.fillna(-1).astype(int).value_counts()
+        .sort_index().rename(index={-1: "NA"}).to_string().replace("\n", "\n  "))
+
+    ct_all = pd.crosstab(df["Membership_Status"], df["Facet"], margins=True)
+    log("\n  -- crosstab (all species) --")
+    log("  " + ct_all.to_string().replace("\n", "\n  "))
+
+    sub_f = df[df["Facet"] != "Unassigned"]
+    ct = pd.crosstab(sub_f["Membership_Status"], sub_f["Facet"])
+    ct = ct.reindex(index=["Core Member", "Distributed"],
+                    columns=["Unifaceted", "Multifaceted"], fill_value=0)
+    odds, p_f = stats.fisher_exact(ct.to_numpy())
+    n_core = int(ct.loc["Core Member"].sum())
+    n_dist = int(ct.loc["Distributed"].sum())
+    pct_multi_core = ct.loc["Core Member", "Multifaceted"] / max(n_core, 1) * 100
+    pct_multi_dist = ct.loc["Distributed", "Multifaceted"] / max(n_dist, 1) * 100
+    log(f"\n  multifaceted among Core        : "
+        f"{ct.loc['Core Member', 'Multifaceted']}/{n_core} ({pct_multi_core:.1f}%)")
+    log(f"  multifaceted among Distributed : "
+        f"{ct.loc['Distributed', 'Multifaceted']}/{n_dist} ({pct_multi_dist:.1f}%)")
+    log(f"  Fisher exact (Core vs Distributed x Uni vs Multi): "
+        f"OR = {odds:.2f}, p = {p_f:.4g}, n = {len(sub_f)}")
+    if p_f < 0.05 and pct_multi_dist > pct_multi_core:
+        log("  -> Multifaceted repertoires are enriched among Distributed species,")
+        log("     but the two axes are not identical (see Core & Multifaceted list).")
+    elif p_f >= 0.05:
+        log("  -> No significant association: the two axes are independent.")
+
+    e_u = df.loc[df["Facet"] == "Unifaceted", "Entropy"]
+    e_m = df.loc[df["Facet"] == "Multifaceted", "Entropy"]
+    if len(e_u) >= 5 and len(e_m) >= 5:
+        u_stat, p_u = stats.mannwhitneyu(e_m, e_u, alternative="two-sided")
+        log(f"\n  entropy  Unifaceted median {e_u.median():.3f} (n={len(e_u)})  vs  "
+            f"Multifaceted median {e_m.median():.3f} (n={len(e_m)})")
+        log(f"  Mann-Whitney U = {u_stat:.1f}, p = {p_u:.4g}")
+
+    def _list(mask, title):
+        names = df.loc[mask, ["Display_Name", "Archetype", "N_Superfamilies",
+                              "Relative_Abundance"]]
+        log(f"\n  {title}  ({len(names)} species)")
+        for _, r in names.sort_values(["Archetype", "Display_Name"]).iterrows():
+            log(f"      A{int(r['Archetype'])}  SF={int(r['N_Superfamilies'])}  "
+                f"RAW={r['Relative_Abundance']:.3f}  {r['Display_Name']}")
+
+    _list((df["Membership_Status"] == "Core Member") & (df["Facet"] == "Multifaceted"),
+          "Core & Multifaceted")
+    _list((df["Membership_Status"] == "Distributed") & (df["Facet"] == "Unifaceted"),
+          "Distributed & Unifaceted")
+
+    log("\n  -- Core members: facet composition per archetype --")
+    core_mask = df["Membership_Status"] == "Core Member"
+    ct_arch = pd.crosstab(df.loc[core_mask, "Archetype"], df.loc[core_mask, "Facet"])
+    log("  " + ct_arch.to_string().replace("\n", "\n  "))
 
     # --- save
     df.drop(columns=[c for c in ["key", "tax_key"] if c in df.columns]) \

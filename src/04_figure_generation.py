@@ -189,13 +189,13 @@ def draw_panel_B(ax, df_nmf, is_individual=False):
         alpha=0.75, edgecolor="k", s=60, ax=ax)
     ax.axvline(0.80, color="gray", ls="--", lw=1.5, zorder=0)
     ax.set_yscale("log")
-    ax.set_xlabel("Relative abundance of primary archetype\n(Core if >= 0.8)")
+    ax.set_xlabel("Relative archetype weight (RAW) of primary archetype\n(Core if RAW >= 0.80)")
     ax.set_ylabel("Dominance ratio (log scale)")
     ax.get_legend().remove()
 
-    ax.text(0.58, 10**7.5, "Core\n(single-family dominant)",
+    ax.text(0.58, 10**7.5, "Core\n(single-archetype dominant)",
             color=CORE_COLOR, fontsize=11, ha="center", va="center")
-    ax.text(0.35, 10**3, "Distributed\n(multi-family)",
+    ax.text(0.35, 10**3, "Distributed\n(mixed-archetype)",
             color=DIST_COLOR, fontsize=11, ha="center", va="bottom")
     ax.spines[["top", "right"]].set_visible(False)
 

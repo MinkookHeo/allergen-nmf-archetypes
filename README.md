@@ -1,4 +1,4 @@
-# Six fundamental archetypes of food allergy revealed via non-negative matrix factorization
+# Non-negative matrix factorization resolves food allergen repertoires into six archetypes
 
 Code and data to reproduce the non-negative matrix factorization (NMF) pipeline
 and statistical analyses reported in the paper.
@@ -8,7 +8,9 @@ and statistical analyses reported in the paper.
 - `config.py` — paths, constants, colour palette, taxonomic synonym maps.
 - `src/` — analysis scripts.
 - `data/` — processed matrix (`allergen_source_matrix.csv`) and tree files.
-- `results/` — figures, statistical reports and tables (created at runtime).
+- `results/` — figures, statistical reports and tables (created at runtime, not tracked).
+- `outputs/` — archived NMF outputs used in the paper (`nmf_W.npy`, `nmf_H.npy`,
+  `nmf_membership.csv`, `statistics_per_species.csv`).
 
 ## Scripts
 
@@ -18,7 +20,7 @@ and statistical analyses reported in the paper.
 | `02_nmf_k_selection.py` | Consensus clustering across K; cophenetic, RSS and delta-area metrics (Figure 1). |
 | `03_cluster_analysis.py` | NMF at K = 6; Core and Distributed assignment; membership table. |
 | `04_figure_generation.py` | Figure 2 panels and A4 layout; A4 composition of the Figure 3 tree. |
-| `05_statistical_analysis.py` | Descriptive counts, annotation-bias tests, rarefaction, AMI with a permutation null. |
+| `05_statistical_analysis.py` | Descriptive counts, annotation-bias tests, rarefaction, AMI with a permutation null, and unifaceted/multifaceted classification (FACET). |
 | `06_distributed_species_extract.py` | Distributed species ranked by reference-allergen coverage. |
 | `07_phylogeny_itol.py` | Core species list and iTOL annotation files for Figure 3. |
 | `08_figure2d_audit.py` | Verification of the Figure 2D aggregation. |
@@ -41,13 +43,23 @@ written with a placeholder ID.
 
 NMF is used as a soft clustering: every species carries a continuous weight for
 all six archetypes. A species is labelled **Core** when the primary archetype
-holds at least 80% of its total weight (relative abundance >= 0.80), and
-**Distributed** otherwise. Figures that aggregate across taxa (Figure 2D,
+holds at least 80% of its total weight (relative archetype weight, RAW >= 0.80),
+and **Distributed** otherwise. Figures that aggregate across taxa (Figure 2D,
 Figure 3) use the full weight vector rather than a single primary label, so that
 species with mixed repertoires contribute to each archetype they load onto.
 `08_figure2d_audit.py` checks the resulting identity: since the weight matrix is
 row-normalized, the ribbons emanating from a taxonomic order sum to the number
 of species in that order.
+
+## Repertoire breadth (unifaceted / multifaceted)
+
+Independently of archetype dominance, `05` counts the distinct CDD
+superfamilies represented by each species' WHO/IUIS reference allergens (each
+allergen assigned to the superfamily of its highest-scoring homolog domain).
+Species with one superfamily are **unifaceted**, those with two or more
+**multifaceted**. The classification is written to the `Facet` column of
+`statistics_per_species.csv`, and its association with Core/Distributed
+membership is tested with Fisher's exact test.
 
 ## Data availability
 
